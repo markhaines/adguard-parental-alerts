@@ -12,11 +12,44 @@ ADGUARD_USERNAME = os.environ.get("ADGUARD_USERNAME", "")
 ADGUARD_PASSWORD = os.environ.get("ADGUARD_PASSWORD", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
+POLL_INTERVAL = 60
+ADULT_FILTER_IDS = set()
 
-PARENTAL_REASONS = ["filteredparental", "parental", "adult", "safebrowsing"]
-ADULT_KEYWORDS = ["porn", "adult", "xxx", "sex", "nsfw"]
 seen_entries = set()
+
+def parse_adult_filter_ids(value):
+    filter_ids = set()
+    for token in (value or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isascii() or not token.isdigit() or int(token) < 0:
+            raise ValueError(
+                f"invalid ADULT_FILTER_IDS value {token!r}; expected comma-separated non-negative "
+                "integers (for example: 0,42)"
+            )
+        filter_ids.add(int(token))
+    return filter_ids
+
+def parse_poll_interval(value):
+    if value is None:
+        return 60
+    token = value.strip()
+    if not token.isascii() or not token.isdigit() or not 1 <= int(token) <= 86400:
+        raise ValueError(
+            f"invalid POLL_INTERVAL value {value!r}; expected an integer from 1 to 86400 seconds "
+            "(for example: 60)"
+        )
+    return int(token)
+
+def validate_configuration():
+    global ADULT_FILTER_IDS, POLL_INTERVAL
+    try:
+        POLL_INTERVAL = parse_poll_interval(os.environ.get("POLL_INTERVAL"))
+        ADULT_FILTER_IDS = parse_adult_filter_ids(os.environ.get("ADULT_FILTER_IDS"))
+    except ValueError as exc:
+        logger.error(f"Invalid configuration: {exc}")
+        sys.exit(1)
 
 def send_pushover(title, message, priority=1):
     try:
@@ -28,13 +61,12 @@ def send_pushover(title, message, priority=1):
         logger.error(f"Notification failed: {e}")
 
 def is_parental_block(entry):
-    reason = entry.get("reason", "").lower()
-    if any(r in reason for r in PARENTAL_REASONS):
+    if entry.get("reason") == "FilteredParental":
         return True
-    for rule in entry.get("rules", []):
-        if any(kw in str(rule.get("text", "")).lower() for kw in ADULT_KEYWORDS):
-            return True
-        if rule.get("filter_list_id", 0) == 1000001:
+    if entry.get("reason") != "FilteredBlackList":
+        return False
+    for rule in entry.get("rules") or []:
+        if rule.get("filter_list_id") in ADULT_FILTER_IDS:
             return True
     return False
 
@@ -68,6 +100,7 @@ def main():
     if missing:
         logger.error(f"Missing: {', '.join(missing)}")
         sys.exit(1)
+    validate_configuration()
     logger.info(f"Starting monitor - {ADGUARD_URL} every {POLL_INTERVAL}s")
     send_pushover("Monitor Started", f"Watching: {ADGUARD_URL}", priority=0)
     while True:

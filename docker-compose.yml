@@ -10,5 +10,6 @@ services:
       - PUSHOVER_TOKEN=${PUSHOVER_TOKEN}
       - PUSHOVER_USER=${PUSHOVER_USER}
       - POLL_INTERVAL=${POLL_INTERVAL:-60}
+      - ADULT_FILTER_IDS=${ADULT_FILTER_IDS:-}
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
