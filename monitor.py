@@ -35,7 +35,8 @@ ADGUARD_USERNAME = os.environ.get("ADGUARD_USERNAME", "")
 ADGUARD_PASSWORD = os.environ.get("ADGUARD_PASSWORD", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
+POLL_INTERVAL = 60
+ADULT_FILTER_IDS = set()
 VERIFY_TLS_SETTING = os.environ.get("VERIFY_TLS", "true")
 VERIFY_TLS = tls_verification_enabled(VERIFY_TLS_SETTING)
 ADGUARD_CA_BUNDLE = os.environ.get("ADGUARD_CA_BUNDLE", "")
@@ -59,8 +60,39 @@ NOTICE_BACKOFF_CEILING = 3600
 # (the affected items stay queued and are retried) - never a queued item.
 STATE_SAVE_INTERVAL = 25
 
-PARENTAL_REASONS = ["filteredparental", "parental", "adult", "safebrowsing"]
-ADULT_KEYWORDS = ["porn", "adult", "xxx", "sex", "nsfw"]
+def parse_adult_filter_ids(value):
+    filter_ids = set()
+    for token in (value or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isascii() or not token.isdigit():
+            raise ValueError(
+                f"invalid ADULT_FILTER_IDS value {token!r}; expected comma-separated "
+                "non-negative integers (for example: 0,42)")
+        filter_ids.add(int(token))
+    return filter_ids
+
+
+def parse_poll_interval(value):
+    if value is None:
+        return 60
+    token = value.strip()
+    if not token.isascii() or not token.isdigit() or not 1 <= int(token) <= 86400:
+        raise ValueError(
+            f"invalid POLL_INTERVAL value {value!r}; expected an integer from 1 to "
+            "86400 seconds (for example: 60)")
+    return int(token)
+
+
+def validate_configuration():
+    global ADULT_FILTER_IDS, POLL_INTERVAL
+    try:
+        POLL_INTERVAL = parse_poll_interval(os.environ.get("POLL_INTERVAL"))
+        ADULT_FILTER_IDS = parse_adult_filter_ids(os.environ.get("ADULT_FILTER_IDS"))
+    except ValueError as ex:
+        logger.error(f"Invalid configuration: {ex}")
+        sys.exit(1)
 
 DELIVERY_OK = "ok"
 DELIVERY_TRANSIENT = "transient"
@@ -208,13 +240,14 @@ def send_pushover(title, message, priority=1):
         return DELIVERY_TRANSIENT
 
 def is_parental_block(entry):
-    reason = entry.get("reason", "").lower()
-    if any(r in reason for r in PARENTAL_REASONS):
+    if entry.get("reason") == "FilteredParental":
         return True
-    for rule in entry.get("rules", []):
-        if any(kw in str(rule.get("text", "")).lower() for kw in ADULT_KEYWORDS):
-            return True
-        if rule.get("filter_list_id", 0) == 1000001:
+    if entry.get("reason") != "FilteredBlackList":
+        return False
+    for rule in entry.get("rules") or []:
+        # Rewrites and whitelist matches have different reasons and therefore
+        # never reach this branch, including filter ID 0.
+        if rule.get("filter_list_id") in ADULT_FILTER_IDS:
             return True
     return False
 
@@ -393,6 +426,7 @@ def main():
     if missing:
         logger.error(f"Missing: {', '.join(missing)}")
         sys.exit(1)
+    validate_configuration()
     if not VERIFY_TLS:
         logger.warning("TLS certificate verification is DISABLED for AdGuard connections (VERIFY_TLS=false)")
     elif not tls_verification_setting_known(VERIFY_TLS_SETTING):

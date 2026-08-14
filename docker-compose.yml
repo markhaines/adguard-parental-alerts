@@ -24,6 +24,7 @@ services:
       - ALERT_BACKOFF_BASE=${ALERT_BACKOFF_BASE:-60}
       - QUERY_PAGE_SIZE=${QUERY_PAGE_SIZE:-100}
       - MAX_QUERY_PAGES=${MAX_QUERY_PAGES:-100}
+      - ADULT_FILTER_IDS=${ADULT_FILTER_IDS:-}
     volumes:
       - parental-alert-state:/data
     labels:
