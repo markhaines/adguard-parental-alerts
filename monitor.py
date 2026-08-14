@@ -13,9 +13,10 @@ ADGUARD_PASSWORD = os.environ.get("ADGUARD_PASSWORD", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
+ADULT_FILTER_IDS = {
+    int(value.strip()) for value in os.environ.get("ADULT_FILTER_IDS", "").split(",") if value.strip()
+}
 
-PARENTAL_REASONS = ["filteredparental", "parental", "adult", "safebrowsing"]
-ADULT_KEYWORDS = ["porn", "adult", "xxx", "sex", "nsfw"]
 seen_entries = set()
 
 def send_pushover(title, message, priority=1):
@@ -28,13 +29,10 @@ def send_pushover(title, message, priority=1):
         logger.error(f"Notification failed: {e}")
 
 def is_parental_block(entry):
-    reason = entry.get("reason", "").lower()
-    if any(r in reason for r in PARENTAL_REASONS):
+    if entry.get("reason") == "FilteredParental":
         return True
     for rule in entry.get("rules", []):
-        if any(kw in str(rule.get("text", "")).lower() for kw in ADULT_KEYWORDS):
-            return True
-        if rule.get("filter_list_id", 0) == 1000001:
+        if rule.get("filter_list_id") in ADULT_FILTER_IDS:
             return True
     return False
 
