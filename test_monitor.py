@@ -37,6 +37,16 @@ class ClassificationTests(unittest.TestCase):
         entry = {"reason": "FilteredBlackList", "rules": [{"filter_list_id": 0}]}
         self.assertTrue(monitor.is_parental_block(entry))
 
+    def test_custom_rule_rewrite_does_not_match(self):
+        monitor.ADULT_FILTER_IDS = {0}
+        entry = {"reason": "Rewrite", "rules": [{"filter_list_id": 0}]}
+        self.assertFalse(monitor.is_parental_block(entry))
+
+    def test_custom_rule_whitelist_does_not_match(self):
+        monitor.ADULT_FILTER_IDS = {0}
+        entry = {"reason": "NotFiltered", "rules": [{"filter_list_id": 0}]}
+        self.assertFalse(monitor.is_parental_block(entry))
+
     def test_null_rules_do_not_abort_classification(self):
         self.assertFalse(monitor.is_parental_block({"reason": "FilteredBlackList", "rules": None}))
 

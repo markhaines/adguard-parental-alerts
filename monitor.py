@@ -63,6 +63,8 @@ def send_pushover(title, message, priority=1):
 def is_parental_block(entry):
     if entry.get("reason") == "FilteredParental":
         return True
+    if entry.get("reason") != "FilteredBlackList":
+        return False
     for rule in entry.get("rules") or []:
         if rule.get("filter_list_id") in ADULT_FILTER_IDS:
             return True
