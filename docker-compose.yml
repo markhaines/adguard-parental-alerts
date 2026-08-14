@@ -18,5 +18,8 @@ services:
       - POLL_INTERVAL=${POLL_INTERVAL:-60}
       - VERIFY_TLS=${VERIFY_TLS:-true}
       - ADGUARD_CA_BUNDLE=${ADGUARD_CA_BUNDLE:-}
+    # Mount a private CA certificate and set ADGUARD_CA_BUNDLE=/ca/ca.pem.
+    # volumes:
+    #   - ./ca.pem:/ca/ca.pem:ro
     labels:
       - "com.centurylinklabs.watchtower.enable=true"

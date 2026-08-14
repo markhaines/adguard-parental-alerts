@@ -6,13 +6,16 @@ import os, sys, time, logging, requests, urllib3
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def tls_verification_enabled(value):
+    return value.lower() not in ("0", "false", "no")
+
 ADGUARD_URL = os.environ.get("ADGUARD_URL", "").rstrip("/")
 ADGUARD_USERNAME = os.environ.get("ADGUARD_USERNAME", "")
 ADGUARD_PASSWORD = os.environ.get("ADGUARD_PASSWORD", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
-VERIFY_TLS = os.environ.get("VERIFY_TLS", "true").lower() not in ("0", "false", "no")
+VERIFY_TLS = tls_verification_enabled(os.environ.get("VERIFY_TLS", "true"))
 ADGUARD_CA_BUNDLE = os.environ.get("ADGUARD_CA_BUNDLE", "")
 
 if not VERIFY_TLS:
@@ -72,6 +75,11 @@ def main():
     if missing:
         logger.error(f"Missing: {', '.join(missing)}")
         sys.exit(1)
+    if ADGUARD_CA_BUNDLE and not (os.path.isfile(ADGUARD_CA_BUNDLE) and os.access(ADGUARD_CA_BUNDLE, os.R_OK)):
+        logger.error(f"ADGUARD_CA_BUNDLE is not a readable file: {ADGUARD_CA_BUNDLE}. Mount the CA certificate into the container and use its in-container path.")
+        sys.exit(1)
+    if not VERIFY_TLS:
+        logger.warning("TLS certificate verification is DISABLED for AdGuard connections (VERIFY_TLS=false)")
     logger.info(f"Starting monitor - {ADGUARD_URL} every {POLL_INTERVAL}s")
     send_pushover("Monitor Started", f"Watching: {ADGUARD_URL}", priority=0)
     while True:
