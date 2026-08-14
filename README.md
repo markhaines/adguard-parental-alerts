@@ -11,10 +11,10 @@ Copy `.env.example` to `.env` and configure these variables:
 - `ADGUARD_PASSWORD` (required): the password for that account.
 - `PUSHOVER_TOKEN` (required): the Pushover application's API token.
 - `PUSHOVER_USER` (required): the Pushover user or group key that receives alerts.
-- `POLL_INTERVAL` (optional): a positive integer number of seconds between query-log polls. The default is `60`.
-- `ADULT_FILTER_IDS` (optional): comma-separated positive integer filter-list IDs, such as `42,43`. Whitespace and duplicate IDs are accepted. When unset or empty, only AdGuard's native `FilteredParental` events generate alerts.
+- `POLL_INTERVAL` (optional): an integer number of seconds from `1` to `86400` (24 hours) between query-log polls. The default is `60`.
+- `ADULT_FILTER_IDS` (optional): comma-separated non-negative integer filter-list IDs, such as `0,42`. Whitespace and duplicate IDs are accepted. When unset or empty, only AdGuard's native `FilteredParental` events generate alerts.
 
-> **Subscribed adult blocklists require configuration.** AdGuard Home reports blocks from subscribed adult blocklists as `FilteredBlackList`, not `FilteredParental`. If you rely on a subscribed adult blocklist instead of AdGuard's native Parental Control, you **must** add that list's numeric ID to `ADULT_FILTER_IDS` or those blocks will not generate alerts. This setting does not make every `FilteredBlackList` event parental; only rules belonging to the listed IDs are included.
+> **Adult blocklists and custom rules require configuration.** AdGuard Home reports blocks from subscribed adult blocklists as `FilteredBlackList`, not `FilteredParental`. If you rely on a subscribed adult blocklist instead of AdGuard's native Parental Control, you **must** add that list's numeric ID to `ADULT_FILTER_IDS` or those blocks will not generate alerts. AdGuard uses filter-list ID `0` for Custom filtering rules, so set `ADULT_FILTER_IDS=0` if you maintain adult-domain blocks there. This setting does not make every `FilteredBlackList` event parental; only rules belonging to the listed IDs are included.
 
 Earlier versions treated filter-list ID `1000001` as adult content automatically. That special default has been removed: if you relied on it, add `1000001` to `ADULT_FILTER_IDS` explicitly to retain those alerts.
 

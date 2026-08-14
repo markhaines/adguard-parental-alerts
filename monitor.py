@@ -23,10 +23,10 @@ def parse_adult_filter_ids(value):
         token = token.strip()
         if not token:
             continue
-        if not token.isascii() or not token.isdigit() or int(token) <= 0:
+        if not token.isascii() or not token.isdigit() or int(token) < 0:
             raise ValueError(
-                f"invalid ADULT_FILTER_IDS value {token!r}; expected comma-separated positive integers "
-                "(for example: 42,43)"
+                f"invalid ADULT_FILTER_IDS value {token!r}; expected comma-separated non-negative "
+                "integers (for example: 0,42)"
             )
         filter_ids.add(int(token))
     return filter_ids
@@ -35,9 +35,9 @@ def parse_poll_interval(value):
     if value is None:
         return 60
     token = value.strip()
-    if not token.isascii() or not token.isdigit() or int(token) <= 0:
+    if not token.isascii() or not token.isdigit() or not 1 <= int(token) <= 86400:
         raise ValueError(
-            f"invalid POLL_INTERVAL value {value!r}; expected a positive integer number of seconds "
+            f"invalid POLL_INTERVAL value {value!r}; expected an integer from 1 to 86400 seconds "
             "(for example: 60)"
         )
     return int(token)

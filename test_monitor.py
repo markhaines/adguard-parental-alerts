@@ -32,6 +32,11 @@ class ClassificationTests(unittest.TestCase):
         entry = {"reason": "FilteredBlackList", "rules": [{"filter_list_id": 42}]}
         self.assertTrue(monitor.is_parental_block(entry))
 
+    def test_configured_custom_rules_id_matches(self):
+        monitor.ADULT_FILTER_IDS = {0}
+        entry = {"reason": "FilteredBlackList", "rules": [{"filter_list_id": 0}]}
+        self.assertTrue(monitor.is_parental_block(entry))
+
     def test_null_rules_do_not_abort_classification(self):
         self.assertFalse(monitor.is_parental_block({"reason": "FilteredBlackList", "rules": None}))
 
@@ -39,6 +44,9 @@ class ClassificationTests(unittest.TestCase):
 class AdultFilterIdsParsingTests(unittest.TestCase):
     def test_valid_list(self):
         self.assertEqual(monitor.parse_adult_filter_ids("42,43"), {42, 43})
+
+    def test_custom_rules_id_zero_is_valid(self):
+        self.assertEqual(monitor.parse_adult_filter_ids("0"), {0})
 
     def test_whitespace_is_ignored(self):
         self.assertEqual(monitor.parse_adult_filter_ids("42, 43 "), {42, 43})
@@ -53,12 +61,12 @@ class AdultFilterIdsParsingTests(unittest.TestCase):
     def test_malformed_token_has_actionable_error(self):
         with self.assertRaisesRegex(
             ValueError,
-            r"invalid ADULT_FILTER_IDS value 'abc'; expected comma-separated positive integers",
+            r"invalid ADULT_FILTER_IDS value 'abc'; expected comma-separated non-negative integers",
         ):
             monitor.parse_adult_filter_ids("42,abc")
 
-    def test_non_positive_or_non_ascii_ids_are_rejected(self):
-        for value in ("-5", "0", "+42", "٤٢"):
+    def test_negative_signed_or_non_ascii_ids_are_rejected(self):
+        for value in ("-5", "+42", "٤٢"):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "ADULT_FILTER_IDS"):
                     monitor.parse_adult_filter_ids(value)
@@ -71,7 +79,7 @@ class PollIntervalParsingTests(unittest.TestCase):
         self.assertEqual(monitor.parse_poll_interval(None), 60)
 
     def test_invalid_or_non_positive_value(self):
-        for value in ("60s", "0", "-1", "+60", "٦٠", ""):
+        for value in ("60s", "0", "-1", "+60", "٦٠", "", "86401"):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "POLL_INTERVAL"):
                     monitor.parse_poll_interval(value)
@@ -112,6 +120,17 @@ class MainConfigurationValidationTests(unittest.TestCase):
             {"POLL_INTERVAL": "60s", "ADULT_FILTER_IDS": "42"},
             "invalid POLL_INTERVAL value '60s'",
         )
+
+    def test_valid_configuration_updates_module_globals(self):
+        with mock.patch.multiple(monitor, ADULT_FILTER_IDS=set(), POLL_INTERVAL=60):
+            with mock.patch.dict(
+                monitor.os.environ,
+                {"POLL_INTERVAL": "30", "ADULT_FILTER_IDS": "0,42"},
+                clear=True,
+            ):
+                monitor.validate_configuration()
+            self.assertEqual(monitor.POLL_INTERVAL, 30)
+            self.assertEqual(monitor.ADULT_FILTER_IDS, {0, 42})
 
 
 if __name__ == "__main__":
