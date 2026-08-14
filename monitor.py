@@ -10,9 +10,13 @@ cursor, outbox overflow, permanently rejected alert, exhausted retries)
 also queues a durable Pushover notice to the operator ahead of ordinary
 alerts. Notices travel through the same persistent outbox as alerts (so a
 lost event is reported at-least-once), are exempt from overflow trimming,
-and their cooldown survives restarts. Delivery failures that indicate a
-Pushover configuration fault (invalid token or user key) never delete
-queued alerts; the queue is preserved until the configuration is fixed.
+and are never dropped through attempt exhaustion: they retry at a capped
+cadence until Pushover accepts them. Recurring incidents aggregate into the
+still-queued notice (occurrence count and time window extended) instead of
+being suppressed, so the operator always sees how many incidents happened.
+Delivery failures that indicate a Pushover configuration fault (invalid
+token or user key) never delete queued alerts; the queue is preserved until
+the configuration is fixed.
 """
 
 import json, os, sys, time, logging, requests, urllib3
@@ -37,7 +41,13 @@ MAX_QUERY_PAGES = int(os.environ.get("MAX_QUERY_PAGES", 100))
 MAX_PENDING_ALERTS = int(os.environ.get("MAX_PENDING_ALERTS", 500))
 MAX_ALERT_ATTEMPTS = int(os.environ.get("MAX_ALERT_ATTEMPTS", 5))
 ALERT_BACKOFF_BASE = int(os.environ.get("ALERT_BACKOFF_BASE", 60))
-NOTICE_COOLDOWN = int(os.environ.get("NOTICE_COOLDOWN", 3600))
+# Notices retry indefinitely at this capped cadence: they are tiny, few and
+# trim-exempt, so unbounded retry is safe, and they must never vanish through
+# attempt exhaustion (that would make a loss condition silently disappear).
+NOTICE_BACKOFF_CEILING = 3600
+# Batch state fsyncs: a crash loses at most one batch of attempt counters
+# (the affected items stay queued and are retried) - never a queued item.
+STATE_SAVE_INTERVAL = 25
 
 PARENTAL_REASONS = ["filteredparental", "parental", "adult", "safebrowsing"]
 ADULT_KEYWORDS = ["porn", "adult", "xxx", "sex", "nsfw"]
@@ -52,8 +62,7 @@ def load_state():
         with open(STATE_FILE, encoding="utf-8") as state_file:
             state = json.load(state_file)
     except FileNotFoundError:
-        return {"version": 2, "cursor": None, "pending": [], "initialised": False,
-                "notices": {}}
+        return {"version": 2, "cursor": None, "pending": [], "initialised": False}
     except (OSError, ValueError) as ex:
         raise RuntimeError(f"Cannot load state from {STATE_FILE}: {ex}") from ex
     if state.get("version", 1) < 2:
@@ -70,7 +79,6 @@ def load_state():
         "cursor": state.get("cursor"),
         "pending": state.get("pending", []),
         "initialised": initialised,
-        "notices": state.get("notices", {}),
     }
 
 
@@ -104,36 +112,59 @@ def entry_id(entry):
     ))
 
 
+def _fmt_ts(ts):
+    if not ts:
+        return "unknown"
+    if isinstance(ts, (int, float)):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    return str(ts)
+
+
 def _fmt_window(start_ts, end_ts):
-    start = start_ts if start_ts else "unknown"
-    end = end_ts if end_ts else "unknown"
-    return f"{start} to {end}"
+    return f"{_fmt_ts(start_ts)} to {_fmt_ts(end_ts)}"
 
 
-def _notify_once(state, name, title, message):
-    """Queue a durable operator notice, at most once per cooldown period.
+def _compose_notice_message(base, count, start, end):
+    if count > 1:
+        return (f"{base}\nOccurrences: {count}\n"
+                f"First detected: {_fmt_ts(start)}\nLast detected: {_fmt_ts(end)}")
+    return f"{base}\nDetected: {_fmt_ts(start)}"
 
-    The notice goes into the same persistent outbox as alerts, marked so it
-    is delivered ahead of ordinary alerts and exempt from overflow trimming.
-    The cooldown is persisted in state, so a crash/restart loop cannot
-    re-emit a notice on every restart. Returns the notice dict, or None if
-    suppressed by the cooldown.
+
+def _notify_once(state, name, title, base_message, extra=(), skip=()):
+    """Record a loss condition as a durable, aggregated operator notice.
+
+    Notices are never dropped and never suppressed. If a notice for this
+    condition is still queued, the recurrence folds into it (occurrence count
+    incremented, time window extended); once the earlier notice has been
+    delivered, a recurrence queues a fresh one. The caller splices the
+    returned notice into the outbox - this function never mutates the list
+    being iterated. Returns (notice, created), where created is False when an
+    existing queued notice was aggregated instead.
     """
     now = time.time()
-    notices = state.setdefault("notices", {})
-    if now - notices.get(name, 0) < NOTICE_COOLDOWN:
-        return None
-    notices[name] = now
+    for existing in list(state["pending"]) + list(extra):
+        if existing.get("kind") != "notice" or existing.get("name") != name:
+            continue
+        if id(existing) in skip:
+            continue
+        existing["count"] = existing.get("count", 1) + 1
+        existing["window_end"] = now
+        existing["message"] = _compose_notice_message(
+            base_message, existing["count"], existing["window_start"], existing["window_end"])
+        return existing, False
     notice = {
         "kind": "notice",
+        "name": name,
         "id": f"notice:{name}:{int(now)}",
         "title": title,
-        "message": message,
+        "count": 1,
+        "window_start": now,
+        "window_end": now,
         "ts": now,
+        "message": _compose_notice_message(base_message, 1, now, now),
     }
-    state["pending"].insert(0, notice)
-    save_state(state)
-    return notice
+    return notice, True
 
 
 def send_pushover(title, message, priority=1):
@@ -198,50 +229,86 @@ def fetch_since(session, cursor):
 def deliver_pending(state):
     # At-least-once: an alert is removed only after Pushover accepts it, so a
     # crash between accept and the state save can re-deliver it on restart.
-    # Transient failures retry with exponential backoff; a permanently
-    # rejected alert or one that exhausts MAX_ALERT_ATTEMPTS is dropped and a
-    # durable notice is queued for the operator. A configuration fault
-    # (invalid token/user key) never deletes alerts - they stay queued and
-    # retry slowly. State is saved after every processed alert so attempt
-    # counters survive a crash mid-pass without losing the unprocessed tail.
-    pending = state["pending"]
+    # The outbox is iterated over an immutable snapshot and rebuilt
+    # separately, so a notice queued mid-pass can never shift the iteration
+    # and reprocess an item.
+    #
+    # Alerts retry with exponential backoff and are dropped only on permanent
+    # rejection (HTTP 400) or after MAX_ALERT_ATTEMPTS, each drop queueing a
+    # durable notice. A configuration fault (invalid token/user key) never
+    # deletes alerts - they stay queued and retry slowly.
+    #
+    # Notices themselves retry indefinitely at a capped cadence and leave the
+    # outbox only when Pushover accepts them; they never recurse into more
+    # notices and are never deleted through attempt exhaustion.
+    #
+    # State is saved in batches (every STATE_SAVE_INTERVAL processed items
+    # and at the end), so a crash loses at most one batch of attempt counters
+    # - never a queued item.
+    snapshot = list(state["pending"])
     remaining = []
     new_notices = []
-    for index, alert in enumerate(pending):
+    delivered_ids = set()
+    dirty = False
+    processed = 0
+    for index, alert in enumerate(snapshot):
         now = time.time()
         if alert.get("next_attempt") and alert["next_attempt"] > now:
             remaining.append(alert)
             continue
-        result = send_pushover(alert["title"], alert["message"])
-        if result == DELIVERY_OK:
-            logger.info(f"Alert delivered: {alert['title']}")
-        elif result == DELIVERY_PERMANENT:
-            logger.error(f"Dropping permanently rejected alert: {alert['title']}")
-            notice = _notify_once(state, "permanent-reject",
-                "Alert dropped: Pushover rejected it",
-                f"{alert['title']}: {alert['message']}")
-            if notice:
-                new_notices.append(notice)
-        elif result == DELIVERY_CONFIG:
-            # Configuration fault: never drop the alert, retry on a slow
-            # cadence, and let the log carry the loud signal (a Pushover
-            # notice would be futile while the credentials are wrong).
-            alert["next_attempt"] = now + ALERT_BACKOFF_BASE * 8
-            remaining.append(alert)
-        else:
-            alert["attempts"] = alert.get("attempts", 0) + 1
-            if alert["attempts"] >= MAX_ALERT_ATTEMPTS:
-                logger.warning(
-                    f"Dropping alert after {alert['attempts']} failed attempts: {alert['title']}")
-                notice = _notify_once(state, "attempts-exhausted",
-                    "Alert dropped: delivery retries exhausted",
-                    f"{alert['title']}: {alert['message']}")
-                if notice:
-                    new_notices.append(notice)
+        if alert.get("kind") == "notice":
+            result = send_pushover(alert["title"], alert["message"])
+            if result == DELIVERY_OK:
+                logger.info(f"Notice delivered: {alert['title']}")
+                delivered_ids.add(id(alert))
             else:
-                alert["next_attempt"] = now + ALERT_BACKOFF_BASE * (2 ** (alert["attempts"] - 1))
+                alert["attempts"] = alert.get("attempts", 0) + 1
+                alert["next_attempt"] = now + min(
+                    ALERT_BACKOFF_BASE * (2 ** (alert["attempts"] - 1)),
+                    NOTICE_BACKOFF_CEILING)
                 remaining.append(alert)
-        state["pending"] = new_notices + remaining + pending[index + 1:]
+            dirty = True
+            processed += 1
+        else:
+            result = send_pushover(alert["title"], alert["message"])
+            if result == DELIVERY_OK:
+                logger.info(f"Alert delivered: {alert['title']}")
+            elif result == DELIVERY_PERMANENT:
+                logger.error(f"Dropping permanently rejected alert: {alert['title']}")
+                notice, created = _notify_once(state, "permanent-reject",
+                    "Alert dropped: Pushover rejected it",
+                    f"{alert['title']}: {alert['message']}",
+                    extra=new_notices, skip=delivered_ids)
+                if created:
+                    new_notices.append(notice)
+            elif result == DELIVERY_CONFIG:
+                # Configuration fault: never drop the alert, retry on a slow
+                # cadence, and let the log carry the loud signal (a Pushover
+                # notice would be futile while the credentials are wrong).
+                alert["next_attempt"] = now + ALERT_BACKOFF_BASE * 8
+                remaining.append(alert)
+            else:
+                alert["attempts"] = alert.get("attempts", 0) + 1
+                if alert["attempts"] >= MAX_ALERT_ATTEMPTS:
+                    logger.warning(
+                        f"Dropping alert after {alert['attempts']} failed attempts: {alert['title']}")
+                    notice, created = _notify_once(state, "attempts-exhausted",
+                        "Alert dropped: delivery retries exhausted",
+                        f"{alert['title']}: {alert['message']}",
+                        extra=new_notices, skip=delivered_ids)
+                    if created:
+                        new_notices.append(notice)
+                else:
+                    alert["next_attempt"] = now + ALERT_BACKOFF_BASE * (2 ** (alert["attempts"] - 1))
+                    remaining.append(alert)
+            dirty = True
+            processed += 1
+        if dirty and processed % STATE_SAVE_INTERVAL == 0:
+            state["pending"] = new_notices + remaining + snapshot[index + 1:]
+            save_state(state)
+            dirty = False
+    if dirty:
+        state["pending"] = new_notices + remaining
         save_state(state)
 
 
@@ -268,11 +335,13 @@ def check_adguard(state):
                 f"Saved cursor was not found in the query log (log rotated/cleared "
                 f"or the backlog exceeded {MAX_QUERY_PAGES} pages); re-baselining to "
                 f"the newest available entry.")
-            _notify_once(state, "cursor-gap", "AdGuard monitoring gap detected",
+            notice, created = _notify_once(state, "cursor-gap", "AdGuard monitoring gap detected",
                 f"Events older than the newest {len(entries)} query-log entries "
                 f"(scanned up to {MAX_QUERY_PAGES * QUERY_PAGE_SIZE}) may have been "
                 f"missed. The monitor has re-baselined to the newest entry and "
                 f"continues.")
+            if created:
+                state["pending"].insert(0, notice)
 
         seen = {alert["id"] for alert in state["pending"]}
         for e in reversed(entries):
@@ -294,15 +363,17 @@ def check_adguard(state):
             dropped = len(alerts) - MAX_PENDING_ALERTS
             window = _fmt_window(alerts[0].get("ts"), alerts[dropped - 1].get("ts"))
             state["pending"] = notices + alerts[dropped:]
-            save_state(state)
             logger.warning(
                 f"Undelivered alert queue exceeded {MAX_PENDING_ALERTS}; "
                 f"dropped the {dropped} oldest undelivered alert(s) "
                 f"(time window {window})")
-            _notify_once(state, "outbox-overflow", "AdGuard alerts dropped",
+            notice, created = _notify_once(state, "outbox-overflow", "AdGuard alerts dropped",
                 f"{dropped} undelivered alerts were dropped because the queue "
                 f"exceeded {MAX_PENDING_ALERTS}. Affected time window: {window}. "
                 f"Check Pushover delivery.")
+            if created:
+                state["pending"].insert(0, notice)
+            save_state(state)
     except Exception as ex:
         logger.error(f"Error: {ex}")
 

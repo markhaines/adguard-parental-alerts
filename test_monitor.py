@@ -155,15 +155,24 @@ class ReliableDeliveryTests(unittest.TestCase):
         self.assertTrue(any("lost-blocked.example" in m for m in sent_messages(send)))
         self.assertTrue(any("may have been missed" in m for m in sent_messages(send)))
 
-    def test_loss_notices_are_cooldown_suppressed(self):
+    def test_recurring_loss_aggregates_notice_count(self):
         fake = FakeAdGuard([])
-        state = {"version": 2, "cursor": "stale", "pending": [],
-                 "initialised": True, "notices": {}}
+        state = {"version": 2, "cursor": "stale", "pending": [], "initialised": True}
+        self.run_check(fake, state, deliver=False)
+        self.run_check(fake, state, deliver=False)
+        notices = [a for a in state["pending"] if a.get("kind") == "notice"]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["name"], "cursor-gap")
+        self.assertEqual(notices[0]["count"], 2)
+        self.assertIn("Occurrences: 2", notices[0]["message"])
+
+    def test_recurrence_after_delivery_is_not_suppressed(self):
+        fake = FakeAdGuard([])
+        state = {"version": 2, "cursor": "stale", "pending": [], "initialised": True}
         send = self.run_check(fake, state, deliver=True)
         self.assertEqual(len([m for m in sent_messages(send) if "may have been missed" in m]), 1)
-        self.assertEqual(state["pending"], [])
         send2 = self.run_check(fake, state, deliver=True)
-        self.assertEqual(len([m for m in sent_messages(send2) if "may have been missed" in m]), 0)
+        self.assertEqual(len([m for m in sent_messages(send2) if "may have been missed" in m]), 1)
         self.assertEqual(state["pending"], [])
 
     def test_first_start_with_empty_log_then_first_batch_delivered(self):
@@ -301,26 +310,28 @@ class ReliableDeliveryTests(unittest.TestCase):
         self.assertEqual(state["pending"], [])
 
     def test_permanent_rejection_drops_alert_and_queues_notice(self):
-        state = {"version": 2, "cursor": "c", "initialised": True, "notices": {},
+        state = {"version": 2, "cursor": "c", "initialised": True,
                  "pending": [{"id": "bad", "title": "t", "message": "m"}]}
         with patch.object(monitor, "send_pushover",
                           return_value=monitor.DELIVERY_PERMANENT):
             monitor.deliver_pending(state)
         self.assertEqual(len(state["pending"]), 1)
         self.assertEqual(state["pending"][0]["kind"], "notice")
+        self.assertEqual(state["pending"][0]["count"], 1)
         self.assertEqual(state["pending"][0]["title"], "Alert dropped: Pushover rejected it")
         with open(monitor.STATE_FILE, encoding="utf-8") as state_file:
             self.assertEqual(json.load(state_file)["pending"][0]["kind"], "notice")
 
     def test_attempts_exhausted_drops_alert_and_queues_notice(self):
         monitor.MAX_ALERT_ATTEMPTS = 2
-        state = {"version": 2, "cursor": "c", "initialised": True, "notices": {},
+        state = {"version": 2, "cursor": "c", "initialised": True,
                  "pending": [{"id": "x", "title": "t", "message": "m", "attempts": 1}]}
         with patch.object(monitor, "send_pushover",
                           return_value=monitor.DELIVERY_TRANSIENT):
             monitor.deliver_pending(state)
         self.assertEqual(len(state["pending"]), 1)
         self.assertEqual(state["pending"][0]["kind"], "notice")
+        self.assertEqual(state["pending"][0]["count"], 1)
         self.assertEqual(state["pending"][0]["title"],
                          "Alert dropped: delivery retries exhausted")
 
@@ -329,7 +340,7 @@ class ReliableDeliveryTests(unittest.TestCase):
         log = [make_entry(f"2024-06-01T00:{m:02d}:00.000Z", f"d{m}.example")
                for m in range(6)]
         fake = FakeAdGuard(log)
-        state = {"version": 2, "cursor": None, "initialised": True, "notices": {},
+        state = {"version": 2, "cursor": None, "initialised": True,
                  "pending": [{"id": f"p{i}", "title": "t", "message": "m",
                               "ts": f"2024-06-01T00:10:0{i}.000Z"}
                              for i in range(3)]}
@@ -351,9 +362,11 @@ class ReliableDeliveryTests(unittest.TestCase):
         log = [make_entry(f"2024-06-01T00:{m:02d}:00.000Z", f"d{m}.example")
                for m in range(8)]
         fake = FakeAdGuard(log)
-        state = {"version": 2, "cursor": None, "initialised": True, "notices": {},
+        state = {"version": 2, "cursor": None, "initialised": True,
                  "pending": [{"id": "notice:cursor-gap:1", "kind": "notice",
-                              "title": "gap", "message": "gap", "ts": 1.0}]}
+                              "name": "cursor-gap", "title": "gap", "message": "gap",
+                              "count": 1, "ts": 1.0,
+                              "window_start": 1.0, "window_end": 1.0}]}
         self.run_check(fake, state, deliver=False)
         kinds = [a.get("kind") for a in state["pending"]]
         self.assertEqual(kinds.count("notice"), 2)
@@ -392,7 +405,6 @@ class ReliableDeliveryTests(unittest.TestCase):
         self.assertTrue(state["initialised"])
         self.assertEqual(state["cursor"], "c|d|1")
         self.assertEqual(state["version"], 2)
-        self.assertEqual(state["notices"], {})
 
         with open(monitor.STATE_FILE, "w", encoding="utf-8") as state_file:
             json.dump({"cursor": "c|d|1", "pending": []}, state_file)
@@ -404,11 +416,10 @@ class ReliableDeliveryTests(unittest.TestCase):
         state = monitor.load_state()
         self.assertFalse(state["initialised"])
         self.assertEqual(state["version"], 2)
-        self.assertEqual(state["notices"], {})
 
     def test_config_fault_keeps_alerts_queued(self):
         monitor.MAX_ALERT_ATTEMPTS = 1
-        state = {"version": 2, "cursor": "c", "initialised": True, "notices": {},
+        state = {"version": 2, "cursor": "c", "initialised": True,
                  "pending": [{"id": "x", "title": "t", "message": "m", "attempts": 1}]}
         with patch.object(monitor, "send_pushover", return_value=monitor.DELIVERY_CONFIG):
             monitor.deliver_pending(state)
@@ -418,36 +429,76 @@ class ReliableDeliveryTests(unittest.TestCase):
         with open(monitor.STATE_FILE, encoding="utf-8") as state_file:
             self.assertEqual(json.load(state_file)["pending"][0]["id"], "x")
 
-    def test_attempt_counters_persist_incrementally_mid_pass(self):
-        state = {"version": 2, "cursor": "c", "initialised": True, "notices": {},
+    def test_crash_mid_batch_loses_at_most_one_batch_of_progress(self):
+        monitor.STATE_SAVE_INTERVAL = 2
+        state = {"version": 2, "cursor": "c", "initialised": True,
                  "pending": [{"id": "a", "title": "t", "message": "m"},
-                             {"id": "b", "title": "t2", "message": "m2"}]}
+                             {"id": "b", "title": "t2", "message": "m2"},
+                             {"id": "c", "title": "t3", "message": "m3"}]}
         with patch.object(monitor, "send_pushover", side_effect=[
-                monitor.DELIVERY_TRANSIENT, OSError("crash")]):
+                monitor.DELIVERY_TRANSIENT, monitor.DELIVERY_TRANSIENT,
+                OSError("crash")]):
             with self.assertRaises(OSError):
                 monitor.deliver_pending(state)
         self.assertEqual(state["pending"][0]["id"], "a")
         self.assertEqual(state["pending"][0]["attempts"], 1)
         self.assertEqual(state["pending"][1]["id"], "b")
+        self.assertEqual(state["pending"][1]["attempts"], 1)
         with open(monitor.STATE_FILE, encoding="utf-8") as state_file:
             persisted = json.load(state_file)
         self.assertEqual(persisted["pending"][0]["attempts"], 1)
-        self.assertEqual(persisted["pending"][1]["id"], "b")
+        self.assertEqual(persisted["pending"][1]["attempts"], 1)
+        self.assertEqual(persisted["pending"][2]["id"], "c")
+        self.assertNotIn("attempts", persisted["pending"][2])
 
     def test_notice_survives_restart_and_is_delivered(self):
         fake = FakeAdGuard([])
-        state = {"version": 2, "cursor": "stale", "pending": [],
-                 "initialised": True, "notices": {}}
+        state = {"version": 2, "cursor": "stale", "pending": [], "initialised": True}
         self.run_check(fake, state, deliver=False)
         self.assertEqual(state["pending"][0]["kind"], "notice")
         reloaded = monitor.load_state()
         self.assertEqual(reloaded["pending"][0]["kind"], "notice")
-        self.assertEqual(reloaded["notices"], state["notices"])
         reloaded["pending"][0]["next_attempt"] = 0
         with patch.object(monitor, "send_pushover", return_value=monitor.DELIVERY_OK) as send:
             monitor.deliver_pending(reloaded)
         self.assertEqual(reloaded["pending"], [])
         self.assertTrue(any("may have been missed" in m for m in sent_messages(send)))
+
+    def test_notice_queued_mid_pass_does_not_reprocess_alert(self):
+        state = {"version": 2, "cursor": "c", "initialised": True,
+                 "pending": [{"id": "a", "title": "t", "message": "m"},
+                             {"id": "b", "title": "t2", "message": "m2"},
+                             {"id": "c", "title": "t3", "message": "m3"}]}
+        calls = {"n": 0}
+        def flaky(title, message):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return monitor.DELIVERY_PERMANENT
+            return monitor.DELIVERY_OK
+        with patch.object(monitor, "send_pushover", side_effect=flaky):
+            monitor.deliver_pending(state)
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(len(state["pending"]), 1)
+        self.assertEqual(state["pending"][0]["kind"], "notice")
+        self.assertEqual(state["pending"][0]["name"], "permanent-reject")
+
+    def test_notice_survives_repeated_failures_without_dropping(self):
+        monitor.ALERT_BACKOFF_BASE = 0
+        state = {"version": 2, "cursor": "stale", "initialised": True,
+                 "pending": [{"id": "n", "kind": "notice", "name": "cursor-gap",
+                              "title": "t", "message": "m", "count": 1,
+                              "ts": 0.0, "window_start": 0.0, "window_end": 0.0}]}
+        for i in range(12):
+            with patch.object(monitor, "send_pushover",
+                              return_value=monitor.DELIVERY_TRANSIENT):
+                monitor.deliver_pending(state)
+        self.assertEqual(len(state["pending"]), 1)
+        self.assertEqual(state["pending"][0]["id"], "n")
+        self.assertEqual(state["pending"][0]["attempts"], 12)
+        with patch.object(monitor, "send_pushover",
+                          return_value=monitor.DELIVERY_OK):
+            monitor.deliver_pending(state)
+        self.assertEqual(state["pending"], [])
 
     def test_save_state_writes_schema_version(self):
         monitor.save_state({"cursor": None, "pending": [], "initialised": True})
