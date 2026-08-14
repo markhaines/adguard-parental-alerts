@@ -13,11 +13,24 @@ ADGUARD_PASSWORD = os.environ.get("ADGUARD_PASSWORD", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
-ADULT_FILTER_IDS = {
-    int(value.strip()) for value in os.environ.get("ADULT_FILTER_IDS", "").split(",") if value.strip()
-}
+ADULT_FILTER_IDS = set()
 
 seen_entries = set()
+
+def parse_adult_filter_ids(value):
+    filter_ids = set()
+    for token in (value or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            filter_ids.add(int(token))
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid ADULT_FILTER_IDS value {token!r}; expected comma-separated integers "
+                "(for example: 42,43)"
+            ) from exc
+    return filter_ids
 
 def send_pushover(title, message, priority=1):
     try:
@@ -61,10 +74,16 @@ def check_adguard():
         logger.error(f"Error: {ex}")
 
 def main():
+    global ADULT_FILTER_IDS
     missing = [n for n, v in [("ADGUARD_URL", ADGUARD_URL), ("ADGUARD_USERNAME", ADGUARD_USERNAME),
         ("ADGUARD_PASSWORD", ADGUARD_PASSWORD), ("PUSHOVER_TOKEN", PUSHOVER_TOKEN), ("PUSHOVER_USER", PUSHOVER_USER)] if not v]
     if missing:
         logger.error(f"Missing: {', '.join(missing)}")
+        sys.exit(1)
+    try:
+        ADULT_FILTER_IDS = parse_adult_filter_ids(os.environ.get("ADULT_FILTER_IDS"))
+    except ValueError as exc:
+        logger.error(f"Invalid configuration: {exc}")
         sys.exit(1)
     logger.info(f"Starting monitor - {ADGUARD_URL} every {POLL_INTERVAL}s")
     send_pushover("Monitor Started", f"Watching: {ADGUARD_URL}", priority=0)
