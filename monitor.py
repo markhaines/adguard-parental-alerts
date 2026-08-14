@@ -7,8 +7,12 @@ save can produce a duplicate notification on restart - never a lost one.
 
 Event loss is never silent. Every condition that may discard events (lost
 cursor, outbox overflow, permanently rejected alert, exhausted retries)
-also sends a best-effort Pushover notice to the operator, so the daemon
-degrades loudly rather than quietly.
+also queues a durable Pushover notice to the operator ahead of ordinary
+alerts. Notices travel through the same persistent outbox as alerts (so a
+lost event is reported at-least-once), are exempt from overflow trimming,
+and their cooldown survives restarts. Delivery failures that indicate a
+Pushover configuration fault (invalid token or user key) never delete
+queued alerts; the queue is preserved until the configuration is fixed.
 """
 
 import json, os, sys, time, logging, requests, urllib3
@@ -26,7 +30,11 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
 QUERY_PAGE_SIZE = int(os.environ.get("QUERY_PAGE_SIZE", 100))
 MAX_QUERY_PAGES = int(os.environ.get("MAX_QUERY_PAGES", 100))
-MAX_PENDING_ALERTS = int(os.environ.get("MAX_PENDING_ALERTS", 100))
+# 500 keeps the outbox small enough to stay well under Pushover's monthly
+# message allowance while a home daemon at a 60s poll would need a sustained
+# outage to fill it; when it does fill, the newest activity is the part worth
+# knowing about.
+MAX_PENDING_ALERTS = int(os.environ.get("MAX_PENDING_ALERTS", 500))
 MAX_ALERT_ATTEMPTS = int(os.environ.get("MAX_ALERT_ATTEMPTS", 5))
 ALERT_BACKOFF_BASE = int(os.environ.get("ALERT_BACKOFF_BASE", 60))
 NOTICE_COOLDOWN = int(os.environ.get("NOTICE_COOLDOWN", 3600))
@@ -37,15 +45,15 @@ ADULT_KEYWORDS = ["porn", "adult", "xxx", "sex", "nsfw"]
 DELIVERY_OK = "ok"
 DELIVERY_TRANSIENT = "transient"
 DELIVERY_PERMANENT = "permanent"
-
-_last_notice = {}
+DELIVERY_CONFIG = "config"
 
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as state_file:
             state = json.load(state_file)
     except FileNotFoundError:
-        return {"version": 2, "cursor": None, "pending": [], "initialised": False}
+        return {"version": 2, "cursor": None, "pending": [], "initialised": False,
+                "notices": {}}
     except (OSError, ValueError) as ex:
         raise RuntimeError(f"Cannot load state from {STATE_FILE}: {ex}") from ex
     if state.get("version", 1) < 2:
@@ -62,6 +70,7 @@ def load_state():
         "cursor": state.get("cursor"),
         "pending": state.get("pending", []),
         "initialised": initialised,
+        "notices": state.get("notices", {}),
     }
 
 
@@ -95,17 +104,36 @@ def entry_id(entry):
     ))
 
 
-def notify_operator(title, message):
-    logger.warning(f"Operator notification: {title} - {message}")
-    send_pushover(title, message)
+def _fmt_window(start_ts, end_ts):
+    start = start_ts if start_ts else "unknown"
+    end = end_ts if end_ts else "unknown"
+    return f"{start} to {end}"
 
 
-def _notify_once(name, title, message):
+def _notify_once(state, name, title, message):
+    """Queue a durable operator notice, at most once per cooldown period.
+
+    The notice goes into the same persistent outbox as alerts, marked so it
+    is delivered ahead of ordinary alerts and exempt from overflow trimming.
+    The cooldown is persisted in state, so a crash/restart loop cannot
+    re-emit a notice on every restart. Returns the notice dict, or None if
+    suppressed by the cooldown.
+    """
     now = time.time()
-    if now - _last_notice.get(name, 0) < NOTICE_COOLDOWN:
-        return
-    _last_notice[name] = now
-    notify_operator(title, message)
+    notices = state.setdefault("notices", {})
+    if now - notices.get(name, 0) < NOTICE_COOLDOWN:
+        return None
+    notices[name] = now
+    notice = {
+        "kind": "notice",
+        "id": f"notice:{name}:{int(now)}",
+        "title": title,
+        "message": message,
+        "ts": now,
+    }
+    state["pending"].insert(0, notice)
+    save_state(state)
+    return notice
 
 
 def send_pushover(title, message, priority=1):
@@ -116,9 +144,22 @@ def send_pushover(title, message, priority=1):
         if r.status_code == 200 and r.json().get("status") == 1:
             logger.info(f"Alert sent: {title}")
             return DELIVERY_OK
-        if 400 <= r.status_code < 500 and r.status_code != 429:
-            logger.error(f"Pushover permanently rejected alert ({r.status_code}): {title}")
+        if r.status_code in (401, 404):
+            # 401 = invalid application token, 404 = invalid or missing user
+            # or group key. That is a configuration fault, not a message
+            # fault: queued alerts are kept and retried slowly rather than
+            # deleted, and the log carries the loud failure signal.
+            logger.error(
+                f"Pushover rejected the request ({r.status_code}): invalid "
+                f"token or user key, check PUSHOVER_TOKEN and PUSHOVER_USER. "
+                f"Queued alerts are being kept: {title}")
+            return DELIVERY_CONFIG
+        if r.status_code == 400:
+            logger.error(f"Pushover rejected the request (400): invalid "
+                         f"message parameters: {title}")
             return DELIVERY_PERMANENT
+        # 429 (rate limit), 5xx (server fault), and any other unexpected
+        # status (e.g. 408) are transient: retry later.
         logger.warning(f"Pushover temporarily unavailable ({r.status_code}): {title}")
         return DELIVERY_TRANSIENT
     except Exception as ex:
@@ -157,39 +198,50 @@ def fetch_since(session, cursor):
 def deliver_pending(state):
     # At-least-once: an alert is removed only after Pushover accepts it, so a
     # crash between accept and the state save can re-deliver it on restart.
-    # Alerts are retried with exponential backoff; a permanently rejected
-    # alert (4xx) or one that exhausts MAX_ALERT_ATTEMPTS is removed and the
-    # operator is notified, so a poisoned alert neither blocks the queue nor
-    # retries without bound.
-    now = time.time()
+    # Transient failures retry with exponential backoff; a permanently
+    # rejected alert or one that exhausts MAX_ALERT_ATTEMPTS is dropped and a
+    # durable notice is queued for the operator. A configuration fault
+    # (invalid token/user key) never deletes alerts - they stay queued and
+    # retry slowly. State is saved after every processed alert so attempt
+    # counters survive a crash mid-pass without losing the unprocessed tail.
+    pending = state["pending"]
     remaining = []
-    changed = False
-    for alert in state["pending"]:
+    new_notices = []
+    for index, alert in enumerate(pending):
+        now = time.time()
         if alert.get("next_attempt") and alert["next_attempt"] > now:
             remaining.append(alert)
             continue
         result = send_pushover(alert["title"], alert["message"])
         if result == DELIVERY_OK:
-            changed = True
             logger.info(f"Alert delivered: {alert['title']}")
         elif result == DELIVERY_PERMANENT:
-            changed = True
             logger.error(f"Dropping permanently rejected alert: {alert['title']}")
-            _notify_once("permanent-reject", "Alert dropped: Pushover rejected it",
+            notice = _notify_once(state, "permanent-reject",
+                "Alert dropped: Pushover rejected it",
                 f"{alert['title']}: {alert['message']}")
+            if notice:
+                new_notices.append(notice)
+        elif result == DELIVERY_CONFIG:
+            # Configuration fault: never drop the alert, retry on a slow
+            # cadence, and let the log carry the loud signal (a Pushover
+            # notice would be futile while the credentials are wrong).
+            alert["next_attempt"] = now + ALERT_BACKOFF_BASE * 8
+            remaining.append(alert)
         else:
             alert["attempts"] = alert.get("attempts", 0) + 1
-            changed = True
             if alert["attempts"] >= MAX_ALERT_ATTEMPTS:
                 logger.warning(
                     f"Dropping alert after {alert['attempts']} failed attempts: {alert['title']}")
-                _notify_once("attempts-exhausted", "Alert dropped: delivery retries exhausted",
+                notice = _notify_once(state, "attempts-exhausted",
+                    "Alert dropped: delivery retries exhausted",
                     f"{alert['title']}: {alert['message']}")
+                if notice:
+                    new_notices.append(notice)
             else:
                 alert["next_attempt"] = now + ALERT_BACKOFF_BASE * (2 ** (alert["attempts"] - 1))
                 remaining.append(alert)
-    if changed:
-        state["pending"] = remaining
+        state["pending"] = new_notices + remaining + pending[index + 1:]
         save_state(state)
 
 
@@ -216,7 +268,7 @@ def check_adguard(state):
                 f"Saved cursor was not found in the query log (log rotated/cleared "
                 f"or the backlog exceeded {MAX_QUERY_PAGES} pages); re-baselining to "
                 f"the newest available entry.")
-            _notify_once("cursor-gap", "AdGuard monitoring gap detected",
+            _notify_once(state, "cursor-gap", "AdGuard monitoring gap detected",
                 f"Events older than the newest {len(entries)} query-log entries "
                 f"(scanned up to {MAX_QUERY_PAGES * QUERY_PAGE_SIZE}) may have been "
                 f"missed. The monitor has re-baselined to the newest entry and "
@@ -230,21 +282,27 @@ def check_adguard(state):
                 seen.add(eid)
                 client = e.get("client_info", {}).get("name", e.get("client", "unknown"))
                 state["pending"].append({"id": eid, "title": "Adult Content Blocked",
-                    "message": f"Domain: {domain}\nClient: {client}\nReason: {e.get('reason', 'unknown')}"})
+                    "message": f"Domain: {domain}\nClient: {client}\nReason: {e.get('reason', 'unknown')}",
+                    "ts": e.get("time")})
         if entries:
             state["cursor"] = entry_id(entries[0])
         save_state(state)
         deliver_pending(state)
-        if len(state["pending"]) > MAX_PENDING_ALERTS:
-            dropped = len(state["pending"]) - MAX_PENDING_ALERTS
-            state["pending"] = state["pending"][:MAX_PENDING_ALERTS]
+        notices = [a for a in state["pending"] if a.get("kind") == "notice"]
+        alerts = [a for a in state["pending"] if a.get("kind") != "notice"]
+        if len(alerts) > MAX_PENDING_ALERTS:
+            dropped = len(alerts) - MAX_PENDING_ALERTS
+            window = _fmt_window(alerts[0].get("ts"), alerts[dropped - 1].get("ts"))
+            state["pending"] = notices + alerts[dropped:]
             save_state(state)
             logger.warning(
                 f"Undelivered alert queue exceeded {MAX_PENDING_ALERTS}; "
-                f"dropped the {dropped} newest undelivered alert(s)")
-            _notify_once("outbox-overflow", "AdGuard alerts dropped",
+                f"dropped the {dropped} oldest undelivered alert(s) "
+                f"(time window {window})")
+            _notify_once(state, "outbox-overflow", "AdGuard alerts dropped",
                 f"{dropped} undelivered alerts were dropped because the queue "
-                f"exceeded {MAX_PENDING_ALERTS}. Check Pushover delivery.")
+                f"exceeded {MAX_PENDING_ALERTS}. Affected time window: {window}. "
+                f"Check Pushover delivery.")
     except Exception as ex:
         logger.error(f"Error: {ex}")
 
@@ -255,7 +313,12 @@ def main():
         logger.error(f"Missing: {', '.join(missing)}")
         sys.exit(1)
     logger.info(f"Starting monitor - {ADGUARD_URL} every {POLL_INTERVAL}s")
-    send_pushover("Monitor Started", f"Watching: {ADGUARD_URL}", priority=0)
+    startup_result = send_pushover("Monitor Started", f"Watching: {ADGUARD_URL}", priority=0)
+    if startup_result == DELIVERY_CONFIG:
+        logger.error(
+            "Pushover rejected the startup message with a configuration error "
+            "(invalid token or user key). Check PUSHOVER_TOKEN and PUSHOVER_USER; "
+            "queued alerts will be kept and retried slowly until fixed.")
     state = load_state()
     while True:
         check_adguard(state)
