@@ -4,7 +4,8 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-RUN addgroup -S monitor && adduser -S -G monitor monitor
+RUN addgroup -S monitor && adduser -S -G monitor monitor \
+    && mkdir -p /data && chown monitor:monitor /data
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
