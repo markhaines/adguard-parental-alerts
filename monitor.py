@@ -12,7 +12,7 @@ ADGUARD_USERNAME = os.environ.get("ADGUARD_USERNAME", "")
 ADGUARD_PASSWORD = os.environ.get("ADGUARD_PASSWORD", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
+POLL_INTERVAL = 60
 ADULT_FILTER_IDS = set()
 
 seen_entries = set()
@@ -23,14 +23,33 @@ def parse_adult_filter_ids(value):
         token = token.strip()
         if not token:
             continue
-        try:
-            filter_ids.add(int(token))
-        except ValueError as exc:
+        if not token.isascii() or not token.isdigit() or int(token) <= 0:
             raise ValueError(
-                f"invalid ADULT_FILTER_IDS value {token!r}; expected comma-separated integers "
+                f"invalid ADULT_FILTER_IDS value {token!r}; expected comma-separated positive integers "
                 "(for example: 42,43)"
-            ) from exc
+            )
+        filter_ids.add(int(token))
     return filter_ids
+
+def parse_poll_interval(value):
+    if value is None:
+        return 60
+    token = value.strip()
+    if not token.isascii() or not token.isdigit() or int(token) <= 0:
+        raise ValueError(
+            f"invalid POLL_INTERVAL value {value!r}; expected a positive integer number of seconds "
+            "(for example: 60)"
+        )
+    return int(token)
+
+def validate_configuration():
+    global ADULT_FILTER_IDS, POLL_INTERVAL
+    try:
+        POLL_INTERVAL = parse_poll_interval(os.environ.get("POLL_INTERVAL"))
+        ADULT_FILTER_IDS = parse_adult_filter_ids(os.environ.get("ADULT_FILTER_IDS"))
+    except ValueError as exc:
+        logger.error(f"Invalid configuration: {exc}")
+        sys.exit(1)
 
 def send_pushover(title, message, priority=1):
     try:
@@ -44,7 +63,7 @@ def send_pushover(title, message, priority=1):
 def is_parental_block(entry):
     if entry.get("reason") == "FilteredParental":
         return True
-    for rule in entry.get("rules", []):
+    for rule in entry.get("rules") or []:
         if rule.get("filter_list_id") in ADULT_FILTER_IDS:
             return True
     return False
@@ -74,17 +93,12 @@ def check_adguard():
         logger.error(f"Error: {ex}")
 
 def main():
-    global ADULT_FILTER_IDS
     missing = [n for n, v in [("ADGUARD_URL", ADGUARD_URL), ("ADGUARD_USERNAME", ADGUARD_USERNAME),
         ("ADGUARD_PASSWORD", ADGUARD_PASSWORD), ("PUSHOVER_TOKEN", PUSHOVER_TOKEN), ("PUSHOVER_USER", PUSHOVER_USER)] if not v]
     if missing:
         logger.error(f"Missing: {', '.join(missing)}")
         sys.exit(1)
-    try:
-        ADULT_FILTER_IDS = parse_adult_filter_ids(os.environ.get("ADULT_FILTER_IDS"))
-    except ValueError as exc:
-        logger.error(f"Invalid configuration: {exc}")
-        sys.exit(1)
+    validate_configuration()
     logger.info(f"Starting monitor - {ADGUARD_URL} every {POLL_INTERVAL}s")
     send_pushover("Monitor Started", f"Watching: {ADGUARD_URL}", priority=0)
     while True:
