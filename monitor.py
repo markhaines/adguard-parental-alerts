@@ -2,7 +2,6 @@
 """AdGuard Home Parental Content Monitor"""
 
 import os, sys, time, logging, requests, urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -13,6 +12,11 @@ ADGUARD_PASSWORD = os.environ.get("ADGUARD_PASSWORD", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
+VERIFY_TLS = os.environ.get("VERIFY_TLS", "true").lower() not in ("0", "false", "no")
+ADGUARD_CA_BUNDLE = os.environ.get("ADGUARD_CA_BUNDLE", "")
+
+if not VERIFY_TLS:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PARENTAL_REASONS = ["filteredparental", "parental", "adult", "safebrowsing"]
 ADULT_KEYWORDS = ["porn", "adult", "xxx", "sex", "nsfw"]
@@ -43,7 +47,7 @@ def check_adguard():
     try:
         s = requests.Session()
         s.auth = (ADGUARD_USERNAME, ADGUARD_PASSWORD)
-        s.verify = False
+        s.verify = ADGUARD_CA_BUNDLE or VERIFY_TLS
         r = s.get(f"{ADGUARD_URL}/control/querylog", params={"limit": 100}, timeout=30)
         if r.status_code != 200:
             logger.error(f"API error: {r.status_code}")

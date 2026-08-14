@@ -3,6 +3,12 @@ services:
     build: .
     container_name: adguard-parental-monitor
     restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       - ADGUARD_URL=${ADGUARD_URL}
       - ADGUARD_USERNAME=${ADGUARD_USERNAME}
@@ -10,5 +16,7 @@ services:
       - PUSHOVER_TOKEN=${PUSHOVER_TOKEN}
       - PUSHOVER_USER=${PUSHOVER_USER}
       - POLL_INTERVAL=${POLL_INTERVAL:-60}
+      - VERIFY_TLS=${VERIFY_TLS:-true}
+      - ADGUARD_CA_BUNDLE=${ADGUARD_CA_BUNDLE:-}
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
