@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """AdGuard Home Parental Content Monitor"""
 
-import os, sys, time, logging, requests, urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import os, sys, time, logging, ssl, requests, urllib3
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def tls_verification_enabled(value):
+    return value.strip().lower() not in ("0", "false", "no")
+
+def tls_verification_setting_known(value):
+    return value.strip().lower() in ("0", "false", "no", "1", "true", "yes")
 
 ADGUARD_URL = os.environ.get("ADGUARD_URL", "").rstrip("/")
 ADGUARD_USERNAME = os.environ.get("ADGUARD_USERNAME", "")
@@ -13,6 +18,12 @@ ADGUARD_PASSWORD = os.environ.get("ADGUARD_PASSWORD", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
+VERIFY_TLS_SETTING = os.environ.get("VERIFY_TLS", "true")
+VERIFY_TLS = tls_verification_enabled(VERIFY_TLS_SETTING)
+ADGUARD_CA_BUNDLE = os.environ.get("ADGUARD_CA_BUNDLE", "")
+
+if not VERIFY_TLS:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PARENTAL_REASONS = ["filteredparental", "parental", "adult", "safebrowsing"]
 ADULT_KEYWORDS = ["porn", "adult", "xxx", "sex", "nsfw"]
@@ -43,7 +54,7 @@ def check_adguard():
     try:
         s = requests.Session()
         s.auth = (ADGUARD_USERNAME, ADGUARD_PASSWORD)
-        s.verify = False
+        s.verify = ADGUARD_CA_BUNDLE if VERIFY_TLS and ADGUARD_CA_BUNDLE else VERIFY_TLS
         r = s.get(f"{ADGUARD_URL}/control/querylog", params={"limit": 100}, timeout=30)
         if r.status_code != 200:
             logger.error(f"API error: {r.status_code}")
@@ -68,6 +79,20 @@ def main():
     if missing:
         logger.error(f"Missing: {', '.join(missing)}")
         sys.exit(1)
+    if not VERIFY_TLS:
+        logger.warning("TLS certificate verification is DISABLED for AdGuard connections (VERIFY_TLS=false)")
+    else:
+        if not tls_verification_setting_known(VERIFY_TLS_SETTING):
+            logger.warning(f"Unrecognized VERIFY_TLS value {VERIFY_TLS_SETTING!r}; TLS verification remains ENABLED. Use 0, false, or no to disable it.")
+        if ADGUARD_CA_BUNDLE:
+            if not (os.path.isfile(ADGUARD_CA_BUNDLE) and os.access(ADGUARD_CA_BUNDLE, os.R_OK)):
+                logger.error(f"ADGUARD_CA_BUNDLE is not a readable file: {ADGUARD_CA_BUNDLE}. Mount the CA certificate into the container and use its in-container path.")
+                sys.exit(1)
+            try:
+                ssl.create_default_context(cafile=ADGUARD_CA_BUNDLE)
+            except (OSError, ssl.SSLError) as ex:
+                logger.error(f"ADGUARD_CA_BUNDLE is not a valid PEM certificate bundle: {ADGUARD_CA_BUNDLE} ({ex})")
+                sys.exit(1)
     logger.info(f"Starting monitor - {ADGUARD_URL} every {POLL_INTERVAL}s")
     send_pushover("Monitor Started", f"Watching: {ADGUARD_URL}", priority=0)
     while True:
