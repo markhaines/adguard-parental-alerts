@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import certifi
 import monitor
 
 
@@ -79,11 +80,26 @@ class StartupTlsTests(unittest.TestCase):
                 monitor.main()
         self.assertEqual(raised.exception.code, 1)
 
+    def test_directory_ca_bundle_exits(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                self.config(ADGUARD_CA_BUNDLE=directory), \
+                patch.object(monitor, "send_pushover"), patch.object(monitor.logger, "error"):
+            with self.assertRaises(SystemExit) as raised:
+                monitor.main()
+        self.assertEqual(raised.exception.code, 1)
+
     def test_empty_ca_bundle_exits(self):
         self.assert_invalid_ca("")
 
     def test_garbage_ca_bundle_exits(self):
         self.assert_invalid_ca("not a PEM certificate")
+
+    def test_valid_pem_bundle_starts(self):
+        with self.config(ADGUARD_CA_BUNDLE=certifi.where()), \
+                patch.object(monitor, "send_pushover"), patch.object(monitor, "load_state"), \
+                patch.object(monitor, "check_adguard", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                monitor.main()
 
     def test_http_url_does_not_validate_ca_bundle(self):
         with self.config(ADGUARD_URL="http://192.168.10.21:80", ADGUARD_CA_BUNDLE="/missing/ca.pem"), \
