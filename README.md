@@ -13,14 +13,15 @@ Copy `.env.example` to `.env` and configure these variables:
 - `PUSHOVER_USER` (required): the Pushover user or group key that receives alerts.
 - `POLL_INTERVAL` (optional): an integer number of seconds from `1` to `86400` (24 hours) between query-log polls. The default is `60`.
 - `ADULT_FILTER_IDS` (optional): comma-separated non-negative integer filter-list IDs, such as `0,42`. Whitespace and duplicate IDs are accepted. When unset or empty, only AdGuard's native `FilteredParental` events generate alerts.
+- `QUERY_PAGE_SIZE` and `MAX_QUERY_PAGES` (optional): positive integers controlling query-log pagination. Both default to `100`; invalid or zero values prevent startup.
 
-> **Adult blocklists and custom rules require configuration.** AdGuard Home reports blocks from subscribed adult blocklists as `FilteredBlackList`, not `FilteredParental`. If you rely on a subscribed adult blocklist instead of AdGuard's native Parental Control, you **must** add that list's numeric ID to `ADULT_FILTER_IDS` or those blocks will not generate alerts. AdGuard uses filter-list ID `0` for Custom filtering rules, so set `ADULT_FILTER_IDS=0` if you maintain adult-domain blocks there. Configured IDs match only `FilteredBlackList` blocks; rewrites and allowlist matches do not generate parental alerts.
+> **Adult blocklists and custom rules require configuration.** Alerts are generated only for the exact reason `FilteredParental`, or for `FilteredBlackList` entries whose filter ID appears in `ADULT_FILTER_IDS`. Other reasons—including `FilteredBlockedService`, `FilteredSafeSearch`, `FilteredSafeBrowsing`, rewrites, and allowlist/`NotFilteredWhiteList` matches—do not generate alerts even when their filter ID is configured. AdGuard uses filter-list ID `0` for Custom filtering rules, so set `ADULT_FILTER_IDS=0` if you maintain adult-domain blacklist rules there.
 
 To find a subscribed list's numeric ID, inspect `rules[].filter_list_id` for one of its blocked queries in the JSON returned by `/control/querylog`, or match the list in `GET /control/filtering/status`. Custom filtering rules always use ID `0`.
 
 Earlier versions treated filter-list ID `1000001` as adult content automatically. That special default has been removed: if you relied on it, add `1000001` to `ADULT_FILTER_IDS` explicitly to retain those alerts.
 
-Malformed `ADULT_FILTER_IDS` or `POLL_INTERVAL` configuration is fail-safe: the monitor refuses to start and logs a clear error instead of running with partial coverage.
+Malformed `ADULT_FILTER_IDS`, `POLL_INTERVAL`, `QUERY_PAGE_SIZE`, or `MAX_QUERY_PAGES` configuration is fail-safe: the monitor refuses to start and logs a clear error instead of running with partial coverage.
 
 Start the service with:
 

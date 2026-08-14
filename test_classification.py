@@ -40,6 +40,14 @@ class ClassificationTests(unittest.TestCase):
             self.assertFalse(monitor.is_parental_block(
                 {"reason": reason, "rules": [{"filter_list_id": 0}]}))
 
+    def test_whitelist_filter_id_zero_never_matches(self):
+        entry = {"reason": "NotFilteredWhiteList",
+                 "rules": [{"filter_list_id": 0, "text": "@@||allowed.example^"}]}
+        for configured_ids in (set(), {0}):
+            with self.subTest(configured_ids=configured_ids):
+                monitor.ADULT_FILTER_IDS = configured_ids
+                self.assertFalse(monitor.is_parental_block(entry))
+
     def test_null_rules_do_not_abort_classification(self):
         self.assertFalse(monitor.is_parental_block({"reason": "FilteredBlackList", "rules": None}))
 
@@ -101,6 +109,12 @@ class MainConfigurationValidationTests(unittest.TestCase):
         self.assert_config_error({"POLL_INTERVAL": "60s", "ADULT_FILTER_IDS": "42"},
                                  "invalid POLL_INTERVAL value '60s'")
 
+    def test_main_rejects_invalid_query_pagination(self):
+        for name, value in (("QUERY_PAGE_SIZE", "0"), ("MAX_QUERY_PAGES", "-1"),
+                            ("QUERY_PAGE_SIZE", "abc"), ("MAX_QUERY_PAGES", "٤٢")):
+            with self.subTest(name=name, value=value):
+                self.assert_config_error({name: value}, f"invalid {name} value {value!r}")
+
     def test_valid_configuration_updates_globals(self):
         with mock.patch.multiple(monitor, ADULT_FILTER_IDS=set(), POLL_INTERVAL=60), \
                 mock.patch.dict(monitor.os.environ,
@@ -108,6 +122,8 @@ class MainConfigurationValidationTests(unittest.TestCase):
             monitor.validate_configuration()
             self.assertEqual(monitor.POLL_INTERVAL, 30)
             self.assertEqual(monitor.ADULT_FILTER_IDS, {0, 42})
+            self.assertEqual(monitor.QUERY_PAGE_SIZE, 100)
+            self.assertEqual(monitor.MAX_QUERY_PAGES, 100)
 
 
 if __name__ == "__main__":

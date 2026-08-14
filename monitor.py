@@ -43,8 +43,8 @@ ADGUARD_CA_BUNDLE = os.environ.get("ADGUARD_CA_BUNDLE", "")
 if not VERIFY_TLS:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 STATE_FILE = os.environ.get("STATE_FILE", "/data/state.json")
-QUERY_PAGE_SIZE = int(os.environ.get("QUERY_PAGE_SIZE", 100))
-MAX_QUERY_PAGES = int(os.environ.get("MAX_QUERY_PAGES", 100))
+QUERY_PAGE_SIZE = 100
+MAX_QUERY_PAGES = 100
 # 500 keeps the outbox small enough to stay well under Pushover's monthly
 # message allowance while a home daemon at a 60s poll would need a sustained
 # outage to fill it; when it does fill, the newest activity is the part worth
@@ -59,6 +59,7 @@ NOTICE_BACKOFF_CEILING = 3600
 # Batch state fsyncs: a crash loses at most one batch of attempt counters
 # (the affected items stay queued and are retried) - never a queued item.
 STATE_SAVE_INTERVAL = 25
+MAX_CONSECUTIVE_PERSISTENCE_FAILURES = 3
 
 def parse_adult_filter_ids(value):
     filter_ids = set()
@@ -85,11 +86,26 @@ def parse_poll_interval(value):
     return int(token)
 
 
+def parse_positive_integer(name, value, default):
+    if value is None:
+        return default
+    token = value.strip()
+    if not token.isascii() or not token.isdigit() or int(token) < 1:
+        raise ValueError(
+            f"invalid {name} value {value!r}; expected a positive integer "
+            f"(for example: {default})")
+    return int(token)
+
+
 def validate_configuration():
-    global ADULT_FILTER_IDS, POLL_INTERVAL
+    global ADULT_FILTER_IDS, POLL_INTERVAL, QUERY_PAGE_SIZE, MAX_QUERY_PAGES
     try:
         POLL_INTERVAL = parse_poll_interval(os.environ.get("POLL_INTERVAL"))
         ADULT_FILTER_IDS = parse_adult_filter_ids(os.environ.get("ADULT_FILTER_IDS"))
+        QUERY_PAGE_SIZE = parse_positive_integer(
+            "QUERY_PAGE_SIZE", os.environ.get("QUERY_PAGE_SIZE"), 100)
+        MAX_QUERY_PAGES = parse_positive_integer(
+            "MAX_QUERY_PAGES", os.environ.get("MAX_QUERY_PAGES"), 100)
     except ValueError as ex:
         logger.error(f"Invalid configuration: {ex}")
         sys.exit(1)
@@ -356,22 +372,29 @@ def deliver_pending(state):
 
 
 def check_adguard(state):
+    persistence_failed = False
     try:
         s = requests.Session()
-        s.auth = (ADGUARD_USERNAME, ADGUARD_PASSWORD)
+        # Resolve verification before attaching credentials so no request can
+        # inherit credentials from a session whose TLS policy is undecided.
         s.verify = ADGUARD_CA_BUNDLE if VERIFY_TLS and ADGUARD_CA_BUNDLE else VERIFY_TLS
+        s.auth = (ADGUARD_USERNAME, ADGUARD_PASSWORD)
         entries, cursor_found = fetch_since(s, state["cursor"])
 
         if not state.get("initialised"):
             if entries:
                 state["cursor"] = entry_id(entries[0])
             state["initialised"] = True
-            save_state(state)
+            try:
+                save_state(state)
+            except OSError as ex:
+                persistence_failed = True
+                logger.error(f"State persistence failed; delivery will continue: {ex}")
             if entries:
                 logger.info("Initial query-log position recorded; historical entries skipped")
             else:
                 logger.info("Initialised against an empty query log; awaiting first entries")
-            return
+            return not persistence_failed
 
         if state["cursor"] and not cursor_found:
             logger.warning(
@@ -398,8 +421,16 @@ def check_adguard(state):
                     "ts": e.get("time")})
         if entries:
             state["cursor"] = entry_id(entries[0])
-        save_state(state)
-        deliver_pending(state)
+        try:
+            save_state(state)
+        except OSError as ex:
+            persistence_failed = True
+            logger.error(f"State persistence failed; delivery will continue: {ex}")
+        try:
+            deliver_pending(state)
+        except OSError as ex:
+            persistence_failed = True
+            logger.error(f"State persistence failed after delivery was attempted: {ex}")
         notices = [a for a in state["pending"] if a.get("kind") == "notice"]
         alerts = [a for a in state["pending"] if a.get("kind") != "notice"]
         if len(alerts) > MAX_PENDING_ALERTS:
@@ -416,9 +447,15 @@ def check_adguard(state):
                 f"Check Pushover delivery.")
             if created:
                 state["pending"].insert(0, notice)
-            save_state(state)
+            try:
+                save_state(state)
+            except OSError as ex:
+                persistence_failed = True
+                logger.error(f"State persistence failed after outbox trimming: {ex}")
+        return not persistence_failed
     except Exception as ex:
         logger.error(f"Error: {ex}")
+        return not persistence_failed
 
 def main():
     missing = [n for n, v in [("ADGUARD_URL", ADGUARD_URL), ("ADGUARD_USERNAME", ADGUARD_USERNAME),
@@ -456,8 +493,18 @@ def main():
             "(invalid token or user key). Check PUSHOVER_TOKEN and PUSHOVER_USER; "
             "queued alerts will be kept and retried slowly until fixed.")
     state = load_state()
+    consecutive_persistence_failures = 0
     while True:
-        check_adguard(state)
+        if check_adguard(state):
+            consecutive_persistence_failures = 0
+        else:
+            consecutive_persistence_failures += 1
+            if consecutive_persistence_failures >= MAX_CONSECUTIVE_PERSISTENCE_FAILURES:
+                logger.critical(
+                    f"State persistence failed for {consecutive_persistence_failures} "
+                    "consecutive polls; exiting so the container runtime surfaces "
+                    "and restarts the unhealthy monitor.")
+                sys.exit(1)
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":

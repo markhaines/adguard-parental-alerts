@@ -51,6 +51,24 @@ class TlsTests(unittest.TestCase):
         for value in ("off", "falsse", "garbage", ""):
             self.assertFalse(monitor.tls_verification_setting_known(value))
 
+    def test_credentials_are_attached_only_after_verify_is_resolved(self):
+        assignments = []
+
+        class OrderedSession:
+            def __setattr__(self, name, value):
+                if name in ("verify", "auth"):
+                    assignments.append(name)
+                object.__setattr__(self, name, value)
+
+            def get(self, url, params=None, timeout=None):
+                return Mock(**{"raise_for_status.return_value": None,
+                               "json.return_value": {"data": []}})
+
+        with patch.object(monitor.requests, "Session", return_value=OrderedSession()), \
+                patch.object(monitor, "save_state"):
+            monitor.check_adguard(self.state())
+        self.assertEqual(assignments[:2], ["verify", "auth"])
+
 
 class StartupTlsTests(unittest.TestCase):
     def config(self, **extra):

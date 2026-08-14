@@ -129,6 +129,47 @@ class ReliableDeliveryTests(unittest.TestCase):
             monitor.check_adguard(state)
         return send
 
+    def test_persistence_failure_does_not_prevent_delivery_attempt(self):
+        entry = make_entry("2024-06-01T00:01:00.000Z", "blocked.example")
+        state = {"version": 2, "cursor": None, "pending": [], "initialised": True}
+        with patch.object(monitor.requests, "Session", return_value=FakeAdGuard([entry])), \
+                patch.object(monitor, "save_state", side_effect=OSError("disk full")), \
+                patch.object(monitor, "deliver_pending") as deliver:
+            persistence_ok = monitor.check_adguard(state)
+        self.assertFalse(persistence_ok)
+        deliver.assert_called_once_with(state)
+
+    def test_three_consecutive_persistence_failures_exit_nonzero(self):
+        state = {"version": 2, "cursor": None, "pending": [], "initialised": True}
+        required = dict(ADGUARD_URL="http://example.test", ADGUARD_USERNAME="user",
+                        ADGUARD_PASSWORD="password", PUSHOVER_TOKEN="token",
+                        PUSHOVER_USER="recipient")
+        with patch.multiple(monitor, **required), \
+                patch.dict(monitor.os.environ, {}, clear=True), \
+                patch.object(monitor, "send_pushover", return_value=monitor.DELIVERY_OK), \
+                patch.object(monitor, "load_state", return_value=state), \
+                patch.object(monitor, "check_adguard", side_effect=[False, False, False]) as check, \
+                patch.object(monitor.time, "sleep"):
+            with self.assertRaises(SystemExit) as raised:
+                monitor.main()
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(check.call_count, monitor.MAX_CONSECUTIVE_PERSISTENCE_FAILURES)
+
+    def test_successful_poll_resets_persistence_failure_counter(self):
+        state = {"version": 2, "cursor": None, "pending": [], "initialised": True}
+        required = dict(ADGUARD_URL="http://example.test", ADGUARD_USERNAME="user",
+                        ADGUARD_PASSWORD="password", PUSHOVER_TOKEN="token",
+                        PUSHOVER_USER="recipient")
+        with patch.multiple(monitor, **required), \
+                patch.dict(monitor.os.environ, {}, clear=True), \
+                patch.object(monitor, "send_pushover", return_value=monitor.DELIVERY_OK), \
+                patch.object(monitor, "load_state", return_value=state), \
+                patch.object(monitor, "check_adguard",
+                             side_effect=[False, False, True, False, False, KeyboardInterrupt]), \
+                patch.object(monitor.time, "sleep"):
+            with self.assertRaises(KeyboardInterrupt):
+                monitor.main()
+
     def test_cursor_pages_across_multiple_pages(self):
         log = [make_entry(f"2024-06-01T00:{m:02d}:00.000Z", f"d{m}.example",
                           reason="NoSuchReason") for m in range(220)]
