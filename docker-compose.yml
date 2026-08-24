@@ -3,6 +3,12 @@ services:
     build: .
     container_name: adguard-parental-monitor
     restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       - ADGUARD_URL=${ADGUARD_URL}
       - ADGUARD_USERNAME=${ADGUARD_USERNAME}
@@ -10,5 +16,19 @@ services:
       - PUSHOVER_TOKEN=${PUSHOVER_TOKEN}
       - PUSHOVER_USER=${PUSHOVER_USER}
       - POLL_INTERVAL=${POLL_INTERVAL:-60}
+      - VERIFY_TLS=${VERIFY_TLS:-true}
+      - ADGUARD_CA_BUNDLE=${ADGUARD_CA_BUNDLE:-}
+      - STATE_FILE=/data/state.json
+      - MAX_PENDING_ALERTS=${MAX_PENDING_ALERTS:-500}
+      - MAX_ALERT_ATTEMPTS=${MAX_ALERT_ATTEMPTS:-5}
+      - ALERT_BACKOFF_BASE=${ALERT_BACKOFF_BASE:-60}
+      - QUERY_PAGE_SIZE=${QUERY_PAGE_SIZE:-100}
+      - MAX_QUERY_PAGES=${MAX_QUERY_PAGES:-100}
+      - ADULT_FILTER_IDS=${ADULT_FILTER_IDS:-}
+    volumes:
+      - parental-alert-state:/data
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
+
+volumes:
+  parental-alert-state:
