@@ -10,5 +10,11 @@ services:
       - PUSHOVER_TOKEN=${PUSHOVER_TOKEN}
       - PUSHOVER_USER=${PUSHOVER_USER}
       - POLL_INTERVAL=${POLL_INTERVAL:-60}
+      - STATE_FILE=/data/state.json
+    volumes:
+      - parental-alert-state:/data
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
+
+volumes:
+  parental-alert-state:
