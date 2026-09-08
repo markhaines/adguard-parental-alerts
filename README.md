@@ -42,35 +42,39 @@ Every setting is an environment variable, all of them in `.env`:
 | `PUSHOVER_TOKEN` | yes | | Pushover application token |
 | `PUSHOVER_USER` | yes | | Pushover user key |
 | `POLL_INTERVAL` | no | `60` | Seconds between query-log polls |
+| `FAILURE_ALERT_AFTER` | no | `5` | Consecutive failed polls before alerting that the monitor itself is broken |
 
 The container exits immediately with a clear message if any required variable is missing.
 
 ## What counts as a block worth alerting on
 
-A query-log entry triggers an alert if any of these hold:
+Entries are classified into one of two categories, each with its own notification
+title, because they are not the same thing:
 
-- its `reason` contains `parental`, `adult`, `safebrowsing` or `filteredparental`
-- a matched filter rule's text contains `porn`, `adult`, `xxx`, `sex` or `nsfw`
-- a matched rule comes from filter list `1000001` (AdGuard's adult-content list)
+| Category | Title | When |
+|---|---|---|
+| Adult | `Adult Content Blocked` | AdGuard's parental filter fired, or the rule came from filter list `1000001` (its adult list), or the domain looks adult by keyword |
+| Malware | `Malware or Phishing Blocked` | AdGuard SafeBrowsing fired |
+
+The first two adult signals are AdGuard's own judgement and are trusted outright. The
+keyword heuristic is the fuzzy one, so it is deliberately strict: a keyword
+(`porn`, `adult`, `xxx`, `sex`, `nsfw`) must be **a whole domain label, or start one, or
+end one**. `pornhub` and `freeporn` both match; `middlesexhospital` does not.
+
+A short list of innocent labels that would still collide is excluded outright:
+the English places ending in `-sex` (Essex, Sussex, Middlesex, Wessex), plus `unisex`,
+`sexton`, and the adult-education family. Extend `KEYWORD_EXCEPTIONS` in `monitor.py`
+rather than loosening the matcher.
 
 ## Known limitations
 
-Both of these are pinned by tests in `tests/test_monitor.py`, so they are current
-behaviour rather than accidents. Neither is fixed, because changing either one is a
-detection-policy decision.
-
-- **`sex` is matched as a bare substring**, so a rule mentioning `essex.ac.uk`,
-  `sussex.ac.uk` or `middlesexhospital.org` raises an adult-content alert. On a tool that
-  tells a parent their child looked at adult content, a false positive is the expensive
-  direction. Tightening it to require a token boundary would fix those but would also stop
-  matching things like `freeporn.com`, so it is a trade-off, not a typo.
-- **SafeBrowsing blocks are reported as adult content.** `safebrowsing` is in the reason
-  list, but AdGuard's SafeBrowsing blocks malware and phishing. Such a block arrives under
-  the title "Adult Content Blocked". The notification body does carry the real reason.
-
-A third thing worth knowing: if AdGuard becomes unreachable, the poller logs the error and
-keeps going. Alerts stop, but nothing tells you they have stopped. Treat this as a nice-to-have
-alerting path, not a guarantee.
+- **The keyword heuristic is a heuristic.** It matches on label boundaries, not meaning,
+  so a genuinely adult domain using none of the five keywords is only caught if AdGuard's
+  own parental filter or adult filter list catches it, which they usually do. Erring
+  towards missing one is deliberate: on a tool that tells a parent their child looked at
+  adult content, a false positive is the expensive direction.
+- **De-duplication is in memory only.** Restarting the container can re-alert on entries
+  still in AdGuard's query log.
 
 ## Development
 
@@ -82,6 +86,15 @@ mypy .             # typecheck
 ```
 
 CI runs all three on every push and pull request.
+
+## If it stops working
+
+The monitor alerts on its own failure. After `FAILURE_ALERT_AFTER` consecutive failed
+polls (default 5, so five minutes at the default interval) it sends **"AdGuard Monitor
+Failing"**, saying explicitly that adult-content alerts are not being delivered, and sends
+**"AdGuard Monitor Recovered"** when polling resumes. Each fires once per episode rather
+than every poll, because a monitor that pages every 60 seconds gets muted, which is the
+same as being silent.
 
 ## Releases
 
