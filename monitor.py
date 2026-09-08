@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """AdGuard Home Parental Content Monitor"""
 
-import os, sys, time, logging, requests, urllib3
+import logging
+import os
+import sys
+import time
+
+import requests
+import urllib3
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,7 +23,7 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
 
 PARENTAL_REASONS = ["filteredparental", "parental", "adult", "safebrowsing"]
 ADULT_KEYWORDS = ["porn", "adult", "xxx", "sex", "nsfw"]
-seen_entries = set()
+seen_entries: set[str] = set()
 
 def send_pushover(title, message, priority=1):
     try:
