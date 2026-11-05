@@ -20,11 +20,13 @@ ADGUARD_USERNAME = os.environ.get("ADGUARD_USERNAME", "")
 ADGUARD_PASSWORD = os.environ.get("ADGUARD_PASSWORD", "")
 PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN", "")
 PUSHOVER_USER = os.environ.get("PUSHOVER_USER", "")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 60))
+# Numeric settings are read and checked in main(), not here: a bad value must be
+# reported by name and exit 1, not crash the import with a traceback.
+POLL_INTERVAL = 60
 
 # How many consecutive failed polls before we say so. A monitor that stops
 # monitoring must not do it quietly.
-FAILURE_ALERT_AFTER = int(os.environ.get("FAILURE_ALERT_AFTER", 5))
+FAILURE_ALERT_AFTER = 5
 
 # Block categories. These are NOT the same thing and must not share a title:
 # SafeBrowsing blocks malware and phishing, which is not a parenting matter.
@@ -74,6 +76,27 @@ def send_pushover(title, message, priority=1):
         logger.info(f"Alert sent: {title}" if r.status_code == 200 else f"Pushover error: {r.status_code}")
     except Exception as e:
         logger.error(f"Notification failed: {e}")
+
+
+def parse_int_setting(name, default, minimum, maximum=None):
+    """Read a whole-number environment variable, or `default` if it is unset or empty.
+
+    Raises ValueError naming the variable if the value is not a whole number or is
+    outside `minimum` to `maximum`. FAILURE_ALERT_AFTER=0, for one, would mean "Failing" never fires
+    and "Recovered" fires on every poll.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a whole number, got {raw!r}") from None
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}, got {value}")
+    return value
 
 
 def labels(text):
@@ -210,20 +233,33 @@ def check_adguard():
             logger.error(f"API error: {r.status_code}")
             _record_outcome(False, f"Last status: HTTP {r.status_code}")
             return
-        for e in r.json().get("data", []):
-            domain = e.get("question", {}).get("name", "unknown")
-            eid = f"{e.get('time', '')}-{domain}"
-            if eid in seen_entries:
-                continue
-            category = classify_block(e)
-            if category:
-                seen_entries[eid] = None
-                client = e.get("client_info", {}).get("name", e.get("client", "unknown"))
-                send_pushover(
-                    TITLES[category],
-                    f"Domain: {domain}\nClient: {client}\nReason: {e.get('reason', 'unknown')}",
-                )
+        data = r.json().get("data", [])
+        unreadable = 0
+        for e in data:
+            # One odd entry is logged and skipped. It must not fail the whole poll,
+            # or it blinds the monitor until it ages out of the page.
+            try:
+                # `or {}`, not a .get default: AdGuard can send these keys as null.
+                domain = (e.get("question") or {}).get("name") or "unknown"
+                eid = f"{e.get('time', '')}-{domain}"
+                if eid in seen_entries:
+                    continue
+                category = classify_block(e)
+                if category:
+                    seen_entries[eid] = None
+                    client = (e.get("client_info") or {}).get("name") or e.get("client") or "unknown"
+                    send_pushover(
+                        TITLES[category],
+                        f"Domain: {domain}\nClient: {client}\nReason: {e.get('reason', 'unknown')}",
+                    )
+            except Exception as ex:
+                unreadable += 1
+                logger.error(f"Skipping unreadable query-log entry: {ex}")
         seen_entries = trim_seen(seen_entries)
+        # A page with nothing readable on it is a blind monitor, not a healthy poll.
+        if data and unreadable == len(data):
+            _record_outcome(False, f"Last error: all {unreadable} query-log entries unreadable")
+            return
         _record_outcome(True)
     except Exception as ex:
         logger.error(f"Error: {ex}")
@@ -231,10 +267,17 @@ def check_adguard():
 
 
 def main():
+    global POLL_INTERVAL, FAILURE_ALERT_AFTER
     missing = [n for n, v in [("ADGUARD_URL", ADGUARD_URL), ("ADGUARD_USERNAME", ADGUARD_USERNAME),
         ("ADGUARD_PASSWORD", ADGUARD_PASSWORD), ("PUSHOVER_TOKEN", PUSHOVER_TOKEN), ("PUSHOVER_USER", PUSHOVER_USER)] if not v]
     if missing:
         logger.error(f"Missing: {', '.join(missing)}")
+        sys.exit(1)
+    try:
+        POLL_INTERVAL = parse_int_setting("POLL_INTERVAL", 60, minimum=1, maximum=86400)
+        FAILURE_ALERT_AFTER = parse_int_setting("FAILURE_ALERT_AFTER", 5, minimum=1)
+    except ValueError as ex:
+        logger.error(f"Invalid configuration: {ex}")
         sys.exit(1)
     logger.info(f"Starting monitor - {ADGUARD_URL} every {POLL_INTERVAL}s")
     send_pushover("Monitor Started", f"Watching: {ADGUARD_URL}", priority=0)

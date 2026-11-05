@@ -7,6 +7,19 @@ Reconstructed from git history on 2026-09-08.
 ## Unreleased
 
 ### Fixed
+- **One query-log entry with a null field failed every poll** (#9). `question` or
+  `client_info` sent as `null` raised, the whole poll counted as failed, and later
+  entries in the page were skipped, until that entry aged out. Null fields now fall back,
+  and an entry that still cannot be read is logged and skipped on its own. A page where no
+  entry can be read still counts as a failed poll. A device with
+  no AdGuard client name is shown by its IP, then `unknown`, rather than a blank.
+- **Bad numeric settings crashed or broke failure alerting** (#11). `POLL_INTERVAL=60s`
+  died with a traceback at import, `FAILURE_ALERT_AFTER=0` meant "Failing" never fired and
+  "Recovered" fired every poll, and `POLL_INTERVAL=0` polled in a tight loop. Both are now
+  checked at startup: a non-integer, a value below 1, or a `POLL_INTERVAL` above 86400
+  exits 1 with a one-line message naming the variable.
+- The `Dockerfile` installs `requirements.txt` on Python 3.12, the version CI tests,
+  instead of its own `pip install requests urllib3` on 3.11 (part of #10).
 - **Innocent domains were reported as adult content.** `sex` and `adult` were matched as
   bare substrings against filter-rule text, so a rule mentioning `essex.ac.uk`,
   `sussex.ac.uk`, `middlesexhospital.org`, `wessexwater.co.uk` or `adulteducation.org`
