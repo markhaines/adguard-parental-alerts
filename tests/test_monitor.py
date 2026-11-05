@@ -178,3 +178,140 @@ def test_recovery_is_reported_only_if_a_failure_was_reported():
 
 def test_the_counter_resets_on_success():
     assert monitor.failure_transition(9, ok=True, threshold=3)[0] == 0
+
+
+# --- the poll loop, with AdGuard and Pushover mocked ----------------------------------
+
+
+class _FakeResponse:
+    status_code = 200
+
+    def __init__(self, data):
+        self._data = data
+
+    def json(self):
+        return {"data": self._data}
+
+
+class _FakeSession:
+    def __init__(self, data):
+        self._data = data
+
+    def get(self, *args, **kwargs):
+        return _FakeResponse(self._data)
+
+
+@pytest.fixture
+def poll(monkeypatch):
+    """Run one check_adguard() against a mocked query log; return the alerts sent."""
+    sent = []
+    monkeypatch.setattr(monitor, "seen_entries", {})
+    monkeypatch.setattr(monitor, "consecutive_failures", 0)
+    monkeypatch.setattr(monitor, "send_pushover", lambda title, message, priority=1: sent.append(message))
+
+    def run(data):
+        monkeypatch.setattr(monitor.requests, "Session", lambda: _FakeSession(data))
+        monitor.check_adguard()
+        return sent
+
+    return run
+
+
+def test_a_null_field_in_one_entry_does_not_fail_the_poll(poll):
+    """Regression for #9: `.get(key, {})` only defaults a MISSING key, so a key present
+    as null raised, failed the whole poll, and skipped every later entry in the page."""
+    sent = poll([
+        {"time": "1", "reason": "FilteredParental", "client_info": None, "client": "10.0.0.5",
+         "question": {"name": "a.example"}},
+        {"time": "2", "reason": "FilteredParental", "question": None, "client": "10.0.0.6"},
+        {"time": "3", "reason": "FilteredParental", "client_info": {"name": None}, "client": "10.0.0.7",
+         "question": {"name": "c.example"}},
+        {"time": "4", "reason": "FilteredParental", "client_info": {"name": "Kids iPad"},
+         "question": {"name": "d.example"}},
+    ])
+    assert monitor.consecutive_failures == 0
+    assert len(sent) == 4
+    assert "Client: 10.0.0.5" in sent[0]
+    assert "Domain: unknown" in sent[1]
+    assert "Client: 10.0.0.7" in sent[2]
+    assert "Client: Kids iPad" in sent[3]
+
+
+def test_an_unusable_entry_is_skipped_and_the_rest_are_still_processed(poll):
+    sent = poll([
+        "not an entry",
+        {"time": "5", "reason": "FilteredParental", "question": {"name": "e.example"}, "client": "10.0.0.8"},
+    ])
+    assert monitor.consecutive_failures == 0
+    assert len(sent) == 1
+
+
+def test_an_empty_client_name_falls_back_to_the_ip_then_unknown(poll):
+    """Regression for #9: a device with no AdGuard client name showed a blank `Client: `."""
+    sent = poll([
+        {"time": "6", "reason": "FilteredParental", "client_info": {"name": ""}, "client": "10.0.0.9",
+         "question": {"name": "f.example"}},
+        {"time": "7", "reason": "FilteredParental", "client_info": {"name": ""}, "client": "",
+         "question": {"name": "g.example"}},
+    ])
+    assert "Client: 10.0.0.9" in sent[0]
+    assert "Client: unknown" in sent[1]
+
+
+# --- numeric settings -----------------------------------------------------------------
+
+
+def test_numeric_settings_default_when_unset(monkeypatch):
+    monkeypatch.delenv("POLL_INTERVAL", raising=False)
+    monkeypatch.setenv("FAILURE_ALERT_AFTER", "")
+    assert monitor.parse_int_setting("POLL_INTERVAL", 60, minimum=1) == 60
+    assert monitor.parse_int_setting("FAILURE_ALERT_AFTER", 5, minimum=1) == 5
+
+
+def test_a_valid_numeric_setting_is_read(monkeypatch):
+    monkeypatch.setenv("POLL_INTERVAL", " 30 ")
+    assert monitor.parse_int_setting("POLL_INTERVAL", 60, minimum=1) == 30
+
+
+@pytest.mark.parametrize("name,value", [
+    ("POLL_INTERVAL", "60s"),
+    ("POLL_INTERVAL", "1.5"),
+    ("POLL_INTERVAL", "0"),
+    ("FAILURE_ALERT_AFTER", "0"),
+    ("FAILURE_ALERT_AFTER", "-1"),
+    ("FAILURE_ALERT_AFTER", "five"),
+])
+def test_a_bad_numeric_setting_is_rejected_with_its_name(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        monitor.parse_int_setting(name, 1, minimum=1)
+
+
+def test_a_bad_numeric_setting_does_not_crash_the_import():
+    """Regression for #11: `int()` ran at import, so POLL_INTERVAL=60s died with a
+    traceback before main() could report it."""
+    import subprocess
+    env = {**os.environ, "POLL_INTERVAL": "60s", "FAILURE_ALERT_AFTER": "x"}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    result = subprocess.run([sys.executable, "-c", "import monitor"], cwd=root, env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("name,value", [("FAILURE_ALERT_AFTER", "0"), ("POLL_INTERVAL", "60s")])
+def test_main_exits_1_naming_a_bad_numeric_setting(monkeypatch, caplog, name, value):
+    """Regression for #11: FAILURE_ALERT_AFTER=0 meant "Failing" never fired and
+    "Recovered" fired on every poll. It must be refused at startup instead."""
+    for required in ("ADGUARD_URL", "ADGUARD_USERNAME", "ADGUARD_PASSWORD", "PUSHOVER_TOKEN", "PUSHOVER_USER"):
+        monkeypatch.setattr(monitor, required, "set")
+    monkeypatch.setenv(name, value)
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("main() went past configuration checks")
+
+    monkeypatch.setattr(monitor, "send_pushover", must_not_run)
+    monkeypatch.setattr(monitor, "check_adguard", must_not_run)
+    with pytest.raises(SystemExit) as exc:
+        monitor.main()
+    assert exc.value.code == 1
+    assert name in caplog.text
