@@ -78,11 +78,11 @@ def send_pushover(title, message, priority=1):
         logger.error(f"Notification failed: {e}")
 
 
-def parse_int_setting(name, default, minimum):
+def parse_int_setting(name, default, minimum, maximum=None):
     """Read a whole-number environment variable, or `default` if it is unset or empty.
 
     Raises ValueError naming the variable if the value is not a whole number or is
-    below `minimum`. FAILURE_ALERT_AFTER=0, for one, would mean "Failing" never fires
+    outside `minimum` to `maximum`. FAILURE_ALERT_AFTER=0, for one, would mean "Failing" never fires
     and "Recovered" fires on every poll.
     """
     raw = os.environ.get(name, "").strip()
@@ -94,6 +94,8 @@ def parse_int_setting(name, default, minimum):
         raise ValueError(f"{name} must be a whole number, got {raw!r}") from None
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}, got {value}")
     return value
 
 
@@ -231,7 +233,9 @@ def check_adguard():
             logger.error(f"API error: {r.status_code}")
             _record_outcome(False, f"Last status: HTTP {r.status_code}")
             return
-        for e in r.json().get("data", []):
+        data = r.json().get("data", [])
+        unreadable = 0
+        for e in data:
             # One odd entry is logged and skipped. It must not fail the whole poll,
             # or it blinds the monitor until it ages out of the page.
             try:
@@ -249,8 +253,13 @@ def check_adguard():
                         f"Domain: {domain}\nClient: {client}\nReason: {e.get('reason', 'unknown')}",
                     )
             except Exception as ex:
+                unreadable += 1
                 logger.error(f"Skipping unreadable query-log entry: {ex}")
         seen_entries = trim_seen(seen_entries)
+        # A page with nothing readable on it is a blind monitor, not a healthy poll.
+        if data and unreadable == len(data):
+            _record_outcome(False, f"Last error: all {unreadable} query-log entries unreadable")
+            return
         _record_outcome(True)
     except Exception as ex:
         logger.error(f"Error: {ex}")
@@ -265,7 +274,7 @@ def main():
         logger.error(f"Missing: {', '.join(missing)}")
         sys.exit(1)
     try:
-        POLL_INTERVAL = parse_int_setting("POLL_INTERVAL", 60, minimum=1)
+        POLL_INTERVAL = parse_int_setting("POLL_INTERVAL", 60, minimum=1, maximum=86400)
         FAILURE_ALERT_AFTER = parse_int_setting("FAILURE_ALERT_AFTER", 5, minimum=1)
     except ValueError as ex:
         logger.error(f"Invalid configuration: {ex}")

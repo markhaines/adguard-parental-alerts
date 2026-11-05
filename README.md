@@ -41,11 +41,11 @@ Every setting is an environment variable, all of them in `.env`:
 | `ADGUARD_PASSWORD` | yes | | AdGuard admin password |
 | `PUSHOVER_TOKEN` | yes | | Pushover application token |
 | `PUSHOVER_USER` | yes | | Pushover user key |
-| `POLL_INTERVAL` | no | `60` | Seconds between query-log polls, at least 1 |
+| `POLL_INTERVAL` | no | `60` | Seconds between query-log polls, 1 to 86400 |
 | `FAILURE_ALERT_AFTER` | no | `5` | Consecutive failed polls before alerting that the monitor itself is broken, at least 1 |
 
 The container exits immediately with a clear message if any required variable is missing,
-or if a numeric setting is not a whole number or is below its minimum.
+or if a numeric setting is not a whole number or is out of range.
 
 ## What counts as a block worth alerting on
 

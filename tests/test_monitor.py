@@ -246,6 +246,14 @@ def test_an_unusable_entry_is_skipped_and_the_rest_are_still_processed(poll):
     assert len(sent) == 1
 
 
+def test_a_page_where_every_entry_is_unreadable_counts_as_a_failed_poll(poll):
+    """Skipping one bad entry must not hide a page that cannot be read at all, for
+    example after a query-log format change. That is a blind monitor."""
+    for _ in range(monitor.FAILURE_ALERT_AFTER):
+        poll(["x", ["y"], 3])
+    assert monitor.consecutive_failures == monitor.FAILURE_ALERT_AFTER
+
+
 def test_an_empty_client_name_falls_back_to_the_ip_then_unknown(poll):
     """Regression for #9: a device with no AdGuard client name showed a blank `Client: `."""
     sent = poll([
@@ -287,6 +295,16 @@ def test_a_bad_numeric_setting_is_rejected_with_its_name(monkeypatch, name, valu
         monitor.parse_int_setting(name, 1, minimum=1)
 
 
+def test_a_numeric_setting_above_its_maximum_is_rejected(monkeypatch):
+    """A huge POLL_INTERVAL passed the minimum, then overflowed time.sleep after the
+    first poll: a traceback and a restart loop."""
+    monkeypatch.setenv("POLL_INTERVAL", "99999999999")
+    with pytest.raises(ValueError, match="POLL_INTERVAL"):
+        monitor.parse_int_setting("POLL_INTERVAL", 60, minimum=1, maximum=86400)
+    monkeypatch.setenv("POLL_INTERVAL", "86400")
+    assert monitor.parse_int_setting("POLL_INTERVAL", 60, minimum=1, maximum=86400) == 86400
+
+
 def test_a_bad_numeric_setting_does_not_crash_the_import():
     """Regression for #11: `int()` ran at import, so POLL_INTERVAL=60s died with a
     traceback before main() could report it."""
@@ -298,12 +316,23 @@ def test_a_bad_numeric_setting_does_not_crash_the_import():
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("name,value", [("FAILURE_ALERT_AFTER", "0"), ("POLL_INTERVAL", "60s")])
+def _main_with_required_settings(monkeypatch):
+    """Set the required settings, and restore the numeric globals main() assigns."""
+    monkeypatch.setattr(monitor, "POLL_INTERVAL", monitor.POLL_INTERVAL)
+    monkeypatch.setattr(monitor, "FAILURE_ALERT_AFTER", monitor.FAILURE_ALERT_AFTER)
+    for required in ("ADGUARD_URL", "ADGUARD_USERNAME", "ADGUARD_PASSWORD", "PUSHOVER_TOKEN", "PUSHOVER_USER"):
+        monkeypatch.setattr(monitor, required, "set")
+
+
+@pytest.mark.parametrize("name,value", [
+    ("FAILURE_ALERT_AFTER", "0"),
+    ("POLL_INTERVAL", "60s"),
+    ("POLL_INTERVAL", "99999999999"),
+])
 def test_main_exits_1_naming_a_bad_numeric_setting(monkeypatch, caplog, name, value):
     """Regression for #11: FAILURE_ALERT_AFTER=0 meant "Failing" never fired and
     "Recovered" fired on every poll. It must be refused at startup instead."""
-    for required in ("ADGUARD_URL", "ADGUARD_USERNAME", "ADGUARD_PASSWORD", "PUSHOVER_TOKEN", "PUSHOVER_USER"):
-        monkeypatch.setattr(monitor, required, "set")
+    _main_with_required_settings(monkeypatch)
     monkeypatch.setenv(name, value)
 
     def must_not_run(*args, **kwargs):
@@ -315,3 +344,23 @@ def test_main_exits_1_naming_a_bad_numeric_setting(monkeypatch, caplog, name, va
         monitor.main()
     assert exc.value.code == 1
     assert name in caplog.text
+
+
+def test_main_applies_valid_numeric_settings(monkeypatch):
+    """The parsed values must reach the poll loop, not just pass validation."""
+    _main_with_required_settings(monkeypatch)
+    monkeypatch.setenv("POLL_INTERVAL", "7")
+    monkeypatch.setenv("FAILURE_ALERT_AFTER", "2")
+    monkeypatch.setattr(monitor, "send_pushover", lambda *a, **k: None)
+    monkeypatch.setattr(monitor, "check_adguard", lambda: None)
+    slept = []
+
+    def stop(seconds):
+        slept.append(seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(monitor.time, "sleep", stop)
+    with pytest.raises(KeyboardInterrupt):
+        monitor.main()
+    assert slept == [7]
+    assert monitor.FAILURE_ALERT_AFTER == 2
